@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+markers = [
+  "integration: local application integration checks",
+  "requires_api: real financial data API; explicit environment opt-in required",
+  "requires_llm: real model API; explicit environment opt-in required",
+]
+

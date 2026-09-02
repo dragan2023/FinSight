@@ -1,0 +1,11 @@
+# ==== 环境与依赖（体积大、可重建，非项目代码）====
+.venv/
+frontend/node_modules/
+.cache/
+
+# ==== 本地密钥（按用户要求不上传；模板见 .env.example）====
+.env
+
+# ==== 会话/工具目录（uploads 内含访问令牌，严禁上传）====
+uploads/
+.dsh-project-memory/

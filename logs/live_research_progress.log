@@ -1,0 +1,76 @@
+created status=queued replay=False id=e797655e2b8f41648372bdf70923a22d
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=3
+  event seq=1 type=task.created {"status": "queued"}
+  event seq=2 type=phase {"detail": "标的已确认：600519.SH。", "phase": "identity"}
+  event seq=3 type=reasoning {"chars": 890}
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=3
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=3
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=3
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=4
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=6
+  event seq=6 type=reasoning {"chars": 509}
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=6
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=6
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=8
+  event seq=8 type=phase {"detail": "程序计算指标完成：7 项（缺数指标保留空值与说明）。", "phase": "metrics"}
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=8
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=9
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=10
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=10
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=10
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=10
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=10
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=10
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=11
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=11
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=11
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=11
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=11
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=11
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=11
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=12
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=12
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=12
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=12
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=12
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=12
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=12
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=12
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=13
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=13
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=13
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=13
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=13
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=13
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=13
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=13
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=14
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=15
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=15
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=15
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=16
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=16
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=17
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=17
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=17
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=17
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=17
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=17
+poll status=running llm=0 fetch=0 tools=0 reasoning_chars=0 events=17
+poll status=completed llm=18 fetch=5 tools=6 reasoning_chars=74809 events=20
+  event seq=26 type=report {"detail": "报告已保存：coverage=sufficient output_integrity=unstructured"}
+  event seq=27 type=usage {}
+terminal status=completed report_id=82506a0250b045f4adcd6ac350de78a8 error=None
+DONE

@@ -1,0 +1,1 @@
+"""Deterministic, evidence-linked calculations (stage 02)."""
