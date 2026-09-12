@@ -27,8 +27,11 @@ function Test-FinSightProcess($process) {
             $argument = if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value }
             if ($argument.StartsWith('-')) { continue }
             # Only the script argument counts; a later data argument must not establish ownership.
-            if (-not [IO.Path]::IsPathRooted($argument)) { return $false }
             try {
+                # Node command lines can contain Chromium/V8 values that are
+                # not legal Windows paths.  They are never this project's Vite
+                # entry point, so ignore them instead of failing startup.
+                if (-not [IO.Path]::IsPathRooted($argument)) { return $false }
                 return [IO.Path]::GetFullPath($argument) -eq $viteScript
             }
             catch { return $false }
@@ -38,7 +41,16 @@ function Test-FinSightProcess($process) {
 }
 
 function Stop-FinSightServices([int[]]$RootIds = @()) {
-    $processes = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'node.exe'")
+    try {
+        $processes = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'node.exe'" -ErrorAction Stop)
+    }
+    catch {
+        # 受限账户下无法读到别的进程命令行时，退回到更窄的验证：只对本机
+        # FinSight 健康检查/页面标题均明确匹配的监听端口执行终止。
+        Write-Warning '无法读取现有 Python/Node 进程；改用 FinSight 端口响应验证。'
+        & (Join-Path $PSScriptRoot 'stop_all.ps1')
+        return
+    }
     $owned = @($processes | Where-Object {
         (Test-FinSightProcess $_) -and
         ($RootIds.Count -eq 0 -or $_.ProcessId -in $RootIds -or $_.ParentProcessId -in $RootIds)

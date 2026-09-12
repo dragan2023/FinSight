@@ -1,0 +1,316 @@
+/* ===== 金融图表设计基座（参照 fuyao.aicubes.cn 16 个最佳实践） ===== */
+.fin-panel {
+  --fin-accent: #246653;
+  background: #fff;
+  border: 1px solid #e1e6dc;
+  border-radius: 12px;
+  padding: 22px 22px 16px;
+  margin-top: 18px;
+  min-width: 0;
+}
+.fin-panel__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.fin-eyebrow {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 2px;
+  color: #98a294;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+.fin-panel__title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--fin-accent);
+  letter-spacing: 0.5px;
+}
+.fin-panel__title em {
+  font-style: normal;
+  color: var(--fin-accent);
+}
+.fin-panel__scope {
+  font-size: 11px;
+  color: #86928a;
+  margin-top: 6px;
+  max-width: 640px;
+  line-height: 1.7;
+}
+.fin-panel__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.fin-panel__body {
+  margin-top: 16px;
+  min-width: 0;
+}
+.fin-panel__foot {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed #e6eadd;
+  font-size: 10px;
+  color: #97a196;
+  line-height: 1.7;
+}
+.fin-provenance::before {
+  content: "◈ ";
+  color: #b4bfae;
+}
+.fin-panel--dark {
+  --fin-accent: #e8ebf0;
+  background: linear-gradient(160deg, #171a20 0%, #101318 100%);
+  border-color: rgba(255, 255, 255, 0.09);
+  color: #e8ebf0;
+}
+.fin-panel--dark .fin-panel__scope,
+.fin-panel--dark .fin-panel__foot {
+  color: #9aa3ae;
+}
+.fin-panel--dark .fin-panel__foot {
+  border-top-color: rgba(255, 255, 255, 0.08);
+}
+.fin-panel--dark .fin-eyebrow {
+  color: #77808c;
+}
+.fin-panel--dark .ant-table,
+.fin-panel--dark .ant-table .ant-table-thead > tr > th,
+.fin-panel--dark .ant-table .ant-table-tbody > tr > td {
+  background: transparent;
+  color: #cdd3db;
+  border-color: rgba(255, 255, 255, 0.07);
+}
+.fin-panel--dark .ant-table .ant-table-thead > tr > th {
+  color: #8d96a2;
+  font-size: 10px;
+}
+
+.fin-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
+  gap: 12px;
+}
+.fin-kpi {
+  background: #f7f9f4;
+  border: 1px solid #e4e9dd;
+  border-radius: 10px;
+  padding: 14px 16px 12px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fin-kpi__label {
+  font-size: 10px;
+  color: #8a958c;
+  letter-spacing: 1px;
+}
+.fin-kpi__value {
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.5px;
+  font-variant-numeric: tabular-nums;
+  color: #223832;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+.fin-kpi__value small {
+  font-size: 11px;
+  font-weight: 400;
+  color: #8a958c;
+  margin-left: 4px;
+}
+.fin-kpi__sub {
+  font-size: 10px;
+  color: #99a398;
+  overflow-wrap: anywhere;
+}
+.fin-kpis--dark .fin-kpi {
+  background: rgba(255, 255, 255, 0.045);
+  border-color: rgba(255, 255, 255, 0.09);
+}
+.fin-kpis--dark .fin-kpi__label,
+.fin-kpis--dark .fin-kpi__sub {
+  color: #8d96a2;
+}
+.fin-kpis--dark .fin-kpi__value {
+  color: #eef1f5;
+}
+.fin-kpis--dark .fin-kpi__value small {
+  color: #77808c;
+}
+
+.fin-legend-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #6c7a74;
+}
+.fin-legend-dot i {
+  width: 10px;
+  height: 4px;
+  border-radius: 2px;
+  display: inline-block;
+}
+.fin-tone-badge {
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.fin-tone-badge--up {
+  color: #c9302c;
+}
+.fin-tone-badge--down {
+  color: #1f9d66;
+}
+.fin-tone-badge--flat {
+  color: #8a958c;
+  font-weight: 400;
+}
+
+.fin-scorebar {
+  display: inline-block;
+  width: 64px;
+  height: 5px;
+  border-radius: 3px;
+  background: #edf1e8;
+  overflow: hidden;
+  vertical-align: middle;
+}
+.fin-scorebar i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+}
+
+.report-dashboard-grid {
+  display: grid;
+  gap: 12px;
+  align-items: stretch;
+}
+
+@media (max-width: 800px) {
+  .report-dashboard-grid > * {
+    grid-column: 1 / -1 !important;
+    grid-row: auto !important;
+  }
+}
+
+/* 连板梯队脉冲（实践 04/12）：行 = 板位，强度条 + 成员 chip */
+.fin-ladder {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.fin-ladder__row {
+  display: grid;
+  grid-template-columns: 52px minmax(70px, 1fr) 44px;
+  gap: 10px;
+  align-items: center;
+}
+.fin-ladder__level {
+  font-size: 11px;
+  font-weight: 600;
+  color: #d0483d;
+  font-variant-numeric: tabular-nums;
+}
+.fin-ladder__track {
+  height: 16px;
+  border-radius: 4px;
+  background: #f6f1ec;
+  overflow: hidden;
+  min-width: 0;
+}
+.fin-ladder__fill {
+  height: 100%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #e0644f, #c9302c);
+  min-width: 4px;
+}
+.fin-ladder__count {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: #223832;
+  font-weight: 600;
+}
+.fin-ladder__chips {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding-left: 62px;
+}
+.fin-chip {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #faf5f0;
+  border: 1px solid #ecdcd2;
+  color: #7d5648;
+  white-space: nowrap;
+}
+.fin-chip small {
+  color: #ab9488;
+  margin-left: 4px;
+}
+.fin-ladder--empty {
+  font-size: 11px;
+  color: #97a196;
+}
+
+/* 暗色面板内的梯队 */
+.fin-panel--dark .fin-ladder__track {
+  background: rgba(255, 255, 255, 0.06);
+}
+.fin-panel--dark .fin-ladder__level {
+  color: #e0644f;
+}
+.fin-panel--dark .fin-ladder__count {
+  color: #eef1f5;
+}
+.fin-panel--dark .fin-chip {
+  background: rgba(224, 100, 79, 0.12);
+  border-color: rgba(224, 100, 79, 0.25);
+  color: #e8b0a5;
+}
+.fin-panel--dark .fin-chip small {
+  color: #937569;
+}
+
+/* 自选监控台（实践 05）：日内区间条 */
+.fin-range {
+  display: inline-block;
+  position: relative;
+  width: 110px;
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #1f9d66, #d9b13b, #c9302c);
+  vertical-align: middle;
+}
+.fin-range i {
+  position: absolute;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid #223832;
+  transform: translate(-50%, -50%);
+}
+
+@media (max-width: 800px) {
+  .fin-panel {
+    padding: 16px 14px 12px;
+  }
+  .fin-ladder__chips {
+    padding-left: 0;
+  }
+}

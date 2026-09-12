@@ -36,7 +36,7 @@ export interface TaskUsageView {
 export interface ResearchTaskView {
   id: string;
   question: string;
-  scope: { thscode?: string; type?: ResearchTaskKind };
+  scope: { thscode?: string; thscodes?: string[]; type?: ResearchTaskKind | ResearchScopeType; start_ms?: number; end_ms?: number };
   status: ResearchTaskStatus;
   budget: TaskBudgetView;
   usage: TaskUsageView;
@@ -103,6 +103,27 @@ export interface ModelSnapshotView {
   json_mode: boolean;
 }
 
+export interface TopologyNodeView { id: string; label: string; category: string; value: number | null; }
+export interface TopologyEdgeView { source: string; target: string; label: string; value: number | null; }
+export interface PanelCellView {
+  row: number; column: number; row_span: number; column_span: number;
+  component: "chart" | "metrics" | "gaps"; reference: string; title: string;
+}
+export interface PanelGridView { columns: number; cells: PanelCellView[]; }
+export interface BacktestPointView { period: string; net_value: number | null; drawdown_pct: number | null; information_coefficient: number | null; }
+export interface RelationHeatView { x_labels: string[]; y_labels: string[]; values: Array<Array<number | null>>; }
+export interface ChartSpecView {
+  id: string;
+  chart_type: "line" | "bar" | "candlestick" | "scatter" | "heatmap" | "relationship" | "topology" | "panel_grid" | "backtest_curve" | "relation_heat";
+  title: string;
+  metric_refs: string[];
+  topology_nodes?: TopologyNodeView[];
+  topology_edges?: TopologyEdgeView[];
+  panel_grid?: PanelGridView | null;
+  backtest_points?: BacktestPointView[];
+  relation_heat?: RelationHeatView | null;
+}
+
 export interface ResearchReportView {
   schema_version: string;
   id: string;
@@ -115,6 +136,7 @@ export interface ResearchReportView {
   created_at: string;
   evidence_ids: string[];
   metrics: MetricValueView[];
+  chart_specs?: ChartSpecView[];
   sections: ReportSectionView[];
   data_gaps: import("./marketData").DataGapView[];
   coverage: "sufficient" | "partial" | "no_business_evidence";
@@ -139,10 +161,12 @@ export interface ReportChatMessageView {
 }
 
 export type ResearchTaskKind = "general" | "company_quality" | "company_comparison" | "thesis_review" | "sector_relative" | "fund_overlap" | "fund_quality" | "market_review";
+export type ResearchScopeType = "company_overview" | "watchlist_review" | "index_strength" | "sector_breadth" | "market_pulse" | "fund_overview" | "fund_compare" | "market_breadth" | "general";
 export interface CreateResearchInput {
   question: string;
   thscode?: string;
   type?: ResearchTaskKind;
+  scope?: { type: ResearchScopeType; thscodes?: string[]; start_ms?: number; end_ms?: number; modules?: string[] };
   budget?: { max_llm_requests?: number; max_fetches?: number; max_tool_rounds?: number };
   model_profile_id?: string;
   client_request_id?: string;
@@ -187,9 +211,22 @@ export const getReportConversation = (reportId: string) =>
   });
 
 export const askReportFollowUp = (reportId: string, input: {
-  question: string; use_web_search: boolean; search_provider?: "bocha" | "tavily";
+  question: string; use_web_search: boolean; search_provider?: "bocha";
 }) => request<{ message: ReportChatMessageView }>({
   url: `/research/reports/${reportId}/conversation/messages`, method: "POST", data: input,
+});
+
+export interface OpenChatMessageView {
+  role: "user" | "assistant";
+  content: string;
+  sources?: { title: string; domain: string; url: string; snippet: string }[];
+  searchNotice?: string;
+}
+
+export const askOpenChat = (input: {
+  question: string; thscode?: string; history: OpenChatMessageView[]; use_web_search: boolean;
+}) => request<{ answer: string; sources: NonNullable<OpenChatMessageView["sources"]>; search_notice?: string | null }>({
+  url: "/research/ai-chat/messages", method: "POST", data: input,
 });
 
 export const addSupplement = (reportId: string, input: SupplementInput) =>

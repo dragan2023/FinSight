@@ -2,6 +2,7 @@
 from __future__ import annotations
 from ..analysis.company_quality import assess_company_quality
 from ..analysis.company_comparison import ComparisonCompany, build_comparison
+from .stock_overview import local_stock_overview
 
 
 def _local_records(repository, thscode: str) -> tuple[list[dict], list[dict], list[dict], list[dict], list[str]]:
@@ -40,10 +41,50 @@ def _field_value(record: dict | None, name: str) -> str | None:
     field = (record or {}).get("fields", {}).get(name) or {}
     return field.get("value")
 
+
+def _financial_completeness(repository, thscode: str) -> list[dict]:
+    periods: dict[str, dict] = {}
+    required = {
+        "income": {"operating_income", "net_profit"},
+        "balance": {"assets_total", "cash", "total_debt"},
+        "cashflow": {"act_cash_flow_net", "pay_fixed_assets_etc_cash"},
+    }
+    for meta in repository.list_evidence(thscode=thscode, limit=200):
+        statement = next((name for name in required if name in meta.endpoint_path or (name == "cashflow" and "cash-flow" in meta.endpoint_path)), None)
+        if not statement:
+            continue
+        found = repository.get_evidence(meta.id)
+        if not found:
+            continue
+        _, records, _ = found
+        for record in records:
+            if record.get("basis") != "annual_report":
+                continue
+            period = record.get("period_end") or record.get("period_key")
+            if not period:
+                continue
+            row = periods.setdefault(period, {"period_end": period, "income": False, "balance": False, "cashflow": False, "missing_fields": [], "disclosed_at": [], "duplicate_versions": 0})
+            fields = record.get("fields") or {}
+            missing = [name for name in required[statement] if (fields.get(name) or {}).get("value") in (None, "")]
+            row[statement] = not missing
+            row["missing_fields"].extend(missing)
+            if record.get("disclosed_at"):
+                row["disclosed_at"].append(record["disclosed_at"])
+            row["duplicate_versions"] += meta.duplicate_versions
+    result = []
+    for period, row in periods.items():
+        row["missing_fields"] = sorted(set(row["missing_fields"]))
+        row["disclosed_at"] = max(row["disclosed_at"]) if row["disclosed_at"] else None
+        result.append(row)
+    return sorted(result, key=lambda row: row["period_end"], reverse=True)[:5]
+
 def local_company_research(repository, thscode: str, industry: str | None = None) -> dict:
     income, balance, cashflow, _, evidence_ids = _local_records(repository, thscode)
     quality=assess_company_quality(income_records=income,balance_records=balance,cashflow_records=cashflow,industry=industry,evidence_ids=evidence_ids)
-    return {"thscode":thscode,"evidence_ids":evidence_ids,"quality":quality.model_dump(mode="json"),"local_only":True}
+    overview = local_stock_overview(repository, thscode)
+    return {"thscode": thscode, "evidence_ids": sorted(set(evidence_ids + overview["evidence_ids"])),
+            "quality": quality.model_dump(mode="json"), "overview": overview,
+            "financial_completeness": _financial_completeness(repository, thscode), "local_only": True}
 
 
 def local_company_comparison(repository, thscodes: list[str], industries: dict[str, str] | None = None) -> dict:

@@ -12,6 +12,7 @@ import {
   Typography,
 } from "antd";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   addSupplement,
   cancelResearchTask,
@@ -24,6 +25,7 @@ import {
   streamResearchEvents,
   taskStatusLabels,
   type ResearchReportView,
+  type ResearchScopeType,
   type ResearchTaskView,
   type SupplementView,
 } from "../../api/research";
@@ -36,6 +38,7 @@ import SecurityPicker from "../../components/SecurityPicker";
 
 const MAX_QUESTION = 2000;
 const MAX_SUPPLEMENT = 8000;
+const SCOPE_TYPES: ResearchScopeType[] = ["company_overview", "watchlist_review", "index_strength", "sector_breadth", "market_pulse", "fund_overview", "fund_compare", "market_breadth", "general"];
 
 /**
  * 研究工作台（计划 03 §2.6/2.7）：选标的、问问题、看公开进度、读报告、
@@ -43,6 +46,12 @@ const MAX_SUPPLEMENT = 8000;
  * 浏览器断线后按 seq 续读，绝不重放生成请求。
  */
 export default function Research() {
+  const [searchParams] = useSearchParams();
+  const requestedScope = SCOPE_TYPES.find((scope) => scope === searchParams.get("scope")) ?? null;
+  const requestedCode = searchParams.get("thscode")?.toUpperCase() ?? "";
+  const requestedEnd = Number(searchParams.get("end_ms"));
+  const typedScope = requestedScope !== null && requestedScope !== "general";
+  const scopeNeedsCode = requestedScope !== "market_pulse" && requestedScope !== "market_breadth" && requestedScope !== "watchlist_review";
   const [identity, setIdentity] = useState<SecurityIdentity | null>(null);
   const [question, setQuestion] = useState("");
   const [task, setTask] = useState<ResearchTaskView | null>(null);
@@ -114,7 +123,8 @@ export default function Research() {
   );
 
   const start = async () => {
-    if (!question.trim() || !identity) return;
+    const targetCode = identity?.thscode ?? requestedCode;
+    if (!question.trim() || (!targetCode && typedScope && scopeNeedsCode)) return;
     setStarting(true);
     setStreamError(null);
     setReport(null);
@@ -123,11 +133,9 @@ export default function Research() {
     lastSeqRef.current = 0;
     try {
       // client_request_id 幂等：重试/重放不会产生第二次计费任务。
-      const body = await createResearchTask({
-        question: question.trim(),
-        thscode: identity.thscode,
-        client_request_id: newClientRequestId(),
-      });
+      const body = await createResearchTask(typedScope
+        ? { question: question.trim(), scope: { type: requestedScope, thscodes: targetCode ? [targetCode] : [], ...(Number.isSafeInteger(requestedEnd) && requestedEnd > 0 ? { end_ms: requestedEnd } : {}) }, client_request_id: newClientRequestId() }
+        : { question: question.trim(), thscode: targetCode || undefined, client_request_id: newClientRequestId() });
       setTask(body.task);
       listen(body.task.id, 0);
     } catch (failure) {
@@ -201,7 +209,7 @@ export default function Research() {
         <div>
           <div className="eyebrow">RESEARCH WORKBENCH</div>
           <h1>研究工作台</h1>
-          <p>问一个问题，FinSight 取证、计算、解释，并把缺口如实列出。</p>
+          <p>{typedScope ? `当前范围：${requestedScope}；范围、来源和预算将在任务中保存。` : "问一个问题，FinSight 取证、计算、解释，并把缺口如实列出。"}</p>
         </div>
         <Tag variant="filled">AI 研究助手</Tag>
       </div>
@@ -235,7 +243,7 @@ export default function Research() {
               <Button
                 type="primary"
                 icon={<ExperimentOutlined aria-hidden />}
-                disabled={!identity || question.trim().length === 0 || running}
+                disabled={((!identity && !requestedCode) && (!typedScope || scopeNeedsCode)) || question.trim().length === 0 || running}
                 loading={starting}
                 onClick={() => void start()}
               >

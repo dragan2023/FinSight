@@ -26,6 +26,9 @@ class Settings(BaseModel):
     # 附件上传（阶段04 批次4）：multipart 请求体外层硬上限（合计 100 MiB 产品上限
     # 之外再留 multipart 编码开销）；中间件按实际流字节计数，不信任 Content-Length。
     attachment_request_cap_bytes: int = Field(default=105 * 1024 * 1024, ge=1024)
+    # 全市场 Parquet 是本机研究原始数据，允许与下载通道相同的 2 GiB 上限；
+    # 仅白名单导入路由可使用，其他写操作仍保留 32 KiB JSON 限制。
+    market_import_cap_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=1024)
     # 附件解析在独立短生命周期子进程中执行（批次6）：Job Object 内存硬限制 +
     # 环境白名单（密钥不继承）+ 硬性超时杀树。生产默认必须开启；False 仅限测试。
     attachment_parse_subprocess: bool = True
@@ -39,6 +42,10 @@ class Settings(BaseModel):
         return self.project_root / "data" / "exports"
 
     @property
+    def market_warehouse_path(self) -> Path:
+        return self.project_root / "data" / "market" / "finsight_market.duckdb"
+
+    @property
     def allowed_origins(self) -> list[str]:
         return [
             f"http://{host}:{port}"
@@ -47,7 +54,7 @@ class Settings(BaseModel):
         ]
 
     def create_directories(self) -> None:
-        for path in ("data/db", "data/evidence", "data/exports", "data/attachments", "logs"):
+        for path in ("data/db", "data/evidence", "data/exports", "data/attachments", "data/market", "logs"):
             (self.project_root / path).mkdir(parents=True, exist_ok=True)
 
 

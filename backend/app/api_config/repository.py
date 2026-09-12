@@ -69,7 +69,7 @@ class ApiRepository:
             if result.rowcount == 0:
                 raise AppError("not_found", "服务配置不存在。", 404)
 
-    def save_tests(self, profile_id: str, results: list[dict]) -> list[dict]:
+    def save_tests(self, profile_id: str, results: list[dict]) -> dict:
         now = datetime.now(timezone.utc).isoformat()
         with self.storage.connect() as db:
             db.execute("BEGIN IMMEDIATE")

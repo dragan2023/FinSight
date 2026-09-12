@@ -9,11 +9,23 @@ from ..research.evidence_store import SCHEMA_VERSION, sanitize_payload
 from ..research.repository import ResearchRepository
 
 TTL_SECONDS = {
-    "snapshot": 60,
+    "price_snapshot": 60,
+    "index_snapshot": 60,
+    "fund_market_snapshot": 60,
+    "auction": 0,
+    "ticker_list": 24 * 3600,
     "ticker_search": 24 * 3600,
+    "reference": 24 * 3600,
+    "index_catalog": 24 * 3600,
+    "index_constituents": 24 * 3600,
+    "corporate_actions": 6 * 3600,
+    "index_history": 6 * 3600,
+    "fund_performance": 6 * 3600,
+    "special_data": 6 * 3600,
     "historical": 6 * 3600,
     "financial": 6 * 3600,
     "calendar": 6 * 3600,
+    "snapshot": 60,
 }
 
 

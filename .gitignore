@@ -6,6 +6,5 @@ frontend/node_modules/
 # ==== 本地密钥（按用户要求不上传；模板见 .env.example）====
 .env
 
-# ==== 会话/工具目录（uploads 内含访问令牌，严禁上传）====
-uploads/
+# ==== 本机工具状态目录 ====
 .dsh-project-memory/

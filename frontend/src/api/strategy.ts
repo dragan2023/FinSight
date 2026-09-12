@@ -1,0 +1,9 @@
+import { request } from "./client";
+export interface StrategySpec { id:string; name:string; family:string; lifecycle:string; version:string; review_decision?:string; }
+export interface StrategyExperiment { id:string; strategy_id:string; strategy_version:string; thscode:string; validation_grade:string; created_at:string; result:{ metrics:Record<string, unknown>; segment_metrics:Record<string, unknown>[]; cost_sensitivity:Record<string, unknown>[]; validation_reasons:string[]; curve:{period:string;net_value:number;benchmark_net_value:number;drawdown_pct:number}[]; trades:Record<string,unknown>[]; year_metrics?:Record<string, unknown>[]; signal_snapshot?:{as_of:string;current_position:number;next_position:number;action:"enter"|"hold"|"exit"|"flat";volatility_gate_passed:boolean;basis:string} }; }
+export interface StrategyCalibration { count:number; brier:number|null; brier_skill_score:number|null; calibration_gap:number|null; recent_brier:number|null; high_confidence_error_rate:number|null; eligible:boolean; reason:string|null; }
+export const listStrategies=()=>request<{strategies:StrategySpec[]}>({url:"/strategies"});
+export const listStrategyExperiments=()=>request<{experiments:StrategyExperiment[]}>({url:"/strategy-experiments"});
+export const runStrategyExperiment=(data:Record<string,unknown>)=>request<{experiment:StrategyExperiment}>({url:"/strategy-experiments",method:"POST",data});
+export const fetchStrategyCalibration=(strategyId:string,strategyVersion:string,horizonDays:number)=>request<{calibration:StrategyCalibration}>({url:`/strategies/${strategyId}/calibration`,params:{strategy_version:strategyVersion,horizon_days:horizonDays}});
+export const reviewStrategy=(strategyId:string,data:{strategy_version:string;horizon_days:number;decision:"validated"|"keep_candidate"|"retire"})=>request<{review:Record<string,unknown>}>({url:`/strategies/${strategyId}/reviews`,method:"POST",data});

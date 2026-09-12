@@ -29,6 +29,9 @@ def model_factory(request: Request) -> ModelFactory:
 def market_service(request: Request) -> MarketDataService:
     return request.app.state.market
 
+def market_warehouse_service(request: Request):
+    return request.app.state.market_warehouse
+
 
 def research_manager(request: Request) -> ResearchTaskManager:
     return request.app.state.research

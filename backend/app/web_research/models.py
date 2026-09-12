@@ -15,12 +15,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..errors import AppError
 
-PROVIDERS = ("bocha", "tavily")
+# 搜索提供方按合规红线收敛为博查单提供方（付费官方 API，仅用户触发）。
+PROVIDERS = ("bocha",)
 FRESHNESS_LEVELS = ("noLimit", "oneDay", "oneWeek", "oneMonth", "oneYear")
 # Visible product cap for one search call; the caller budget may be smaller.
 MAX_SEARCH_LIMIT = 10
-# Visible product cap for one Tavily extract call (billed per successful page).
-MAX_EXTRACT_URLS = 5
 # Storage policy for batch 01: search hits are leads; nothing is stored yet.
 SEARCH_STORAGE_POLICY = Literal["reference_only"]
 

@@ -6,9 +6,11 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .financial_metrics import (cash_minus_total_debt, debt_ratio, expense_to_revenue,
-                                gross_margin, net_margin, net_profit_yoy,
-                                ocf_vs_net_profit, ocf_vs_parent_profit, revenue_yoy)
+from .financial_metrics import (accrual_ratio, cash_conversion, cash_minus_total_debt, debt_ratio,
+                                expense_to_revenue, gross_margin, net_cash_position_ratio,
+                                net_margin, net_profit_yoy, ocf_vs_net_profit,
+                                ocf_vs_parent_profit, operating_cash_surplus_margin,
+                                receivable_pressure, revenue_yoy)
 from .industry_applicability import IndustryKind, MetricApplicability, classify_industry, metric_applicability
 from .models import MetricValue
 
@@ -68,19 +70,26 @@ def assess_company_quality(*, income_records: list[dict], balance_records: list[
     cash = _dimension("profit_cash", "利润与现金", [
         ocf_vs_net_profit(income_records, cashflow_records, evidence_ids=evidence_ids),
         ocf_vs_parent_profit(income_records, cashflow_records, evidence_ids=evidence_ids),
-    ], industry, ["非正利润应单列金额与趋势，不按异常比率排序。"])
+        cash_conversion(income_records, cashflow_records, evidence_ids=evidence_ids),
+        operating_cash_surplus_margin(income_records, cashflow_records, evidence_ids=evidence_ids),
+        accrual_ratio(income_records, balance_records, cashflow_records, evidence_ids=evidence_ids),
+    ], industry, ["经营现金净余量率不等同于完整 FCFF/FCFE；非正利润应单列金额与趋势，不按异常比率排序。"])
     assets = _dimension("asset_quality", "资产质量线索", [], industry,
                         ["当前字段没有存货，且缺少期初余额；不推导周转天数。"])
     liabilities = _dimension("liabilities", "负债与偿付", [
         debt_ratio(balance_records, evidence_ids=evidence_ids),
         cash_minus_total_debt(balance_records, evidence_ids=evidence_ids),
+        net_cash_position_ratio(balance_records, evidence_ids=evidence_ids),
     ], industry, ["缺少有息负债与到期结构，不能推断再融资压力大小。"])
+    assets = _dimension("asset_quality", "资产质量线索", [
+        receivable_pressure(income_records, evidence_ids=evidence_ids),
+    ], industry, ["当前字段没有存货，且缺少期初余额；不推导周转天数。"])
     investment = _dimension("operating_investment", "经营投入", [
         expense_to_revenue(income_records, "sales_fee", "sales_expense_ratio", evidence_ids=evidence_ids),
         expense_to_revenue(income_records, "manage_fee", "management_expense_ratio", evidence_ids=evidence_ids),
         expense_to_revenue(income_records, "research_and_development_expenses", "rd_expense_ratio", evidence_ids=evidence_ids),
     ], industry)
     disclosure = _dimension("audit_disclosure", "审计与披露", [], industry,
-                            ["审计意见、实际披露日期需获得 Tushare 权限或用户提供原文后核验。"])
+                            ["审计意见、实际披露日期需由同花顺已披露字段或用户提供原文后核验。"])
     return CompanyQualityResult(industry=industry, industry_kind=classify_industry(industry),
                                 dimensions=[growth, cash, assets, liabilities, investment, disclosure])

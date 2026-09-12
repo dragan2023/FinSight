@@ -217,3 +217,99 @@ def cash_minus_total_debt(records: list[dict], *, evidence_ids: list[str] | None
                        formula=f"{row['values']['cash']} - {row['values']['total_debt']}  # {row['period']}；仅作简化现金位置观察",
                        evidence_ids=evidence_ids or [],
                        note="负债合计不等同于有息负债，不能据此推断到期压力。")
+
+
+def _matched_annual(groups: list[tuple[list[dict], list[str]]]) -> tuple[str, list[dict]] | None:
+    """Newest shared annual period; normalized period_end is preferred when present."""
+    indexed: list[dict[str, dict]] = []
+    for records, fields in groups:
+        values: dict[str, dict] = {}
+        for record in records or []:
+            if record.get("basis") != "annual_report":
+                continue
+            parsed: dict[str, Decimal] = {}
+            for field_name in fields:
+                field = (record.get("fields") or {}).get(field_name) or {}
+                if field.get("value") in (None, ""):
+                    parsed = {}
+                    break
+                try:
+                    parsed[field_name] = Decimal(field["value"])
+                except Exception:
+                    parsed = {}
+                    break
+            if parsed:
+                key = record.get("period_end") or record.get("period_key")
+                if key:
+                    values[str(key)] = {"period": record.get("period_key"), "values": parsed}
+        indexed.append(values)
+    if not indexed:
+        return None
+    shared = set(indexed[0])
+    for values in indexed[1:]:
+        shared &= set(values)
+    if not shared:
+        return None
+    period_end = max(shared)
+    return period_end, [values[period_end] for values in indexed]
+
+
+def _ratio_metric(metric: str, numerator: Decimal, denominator: Decimal, *, period: str,
+                  formula: str, evidence_ids: list[str], note: str | None = None) -> MetricValue:
+    if denominator == ZERO:
+        return MetricValue(metric=metric, value=None, unit="ratio", basis="annual_report", formula=formula,
+                           evidence_ids=evidence_ids, note="分母为 0，比率无意义，拒绝计算。")
+    return MetricValue(metric=metric, value=format(numerator / denominator, "f"), unit="ratio",
+                       basis="annual_report", formula=f"{formula}  # {period}", evidence_ids=evidence_ids,
+                       note=note)
+
+
+def cash_conversion(income_records: list[dict], cashflow_records: list[dict], *, evidence_ids: list[str] | None = None) -> MetricValue:
+    matched = _matched_annual([(income_records, ["net_profit"]), (cashflow_records, ["act_cash_flow_net"])])
+    if not matched:
+        return MetricValue(metric="cash_conversion", value=None, unit="ratio", basis="annual_report",
+                           formula="act_cash_flow_net / net_profit", evidence_ids=evidence_ids or [],
+                           note="缺少同一报告期的年报净利润和经营现金流，季度口径不做推导。")
+    period, (income, cashflow) = matched
+    return _ratio_metric("cash_conversion", cashflow["values"]["act_cash_flow_net"], income["values"]["net_profit"],
+                         period=period, formula="act_cash_flow_net / net_profit", evidence_ids=evidence_ids or [])
+
+
+def operating_cash_surplus_margin(income_records: list[dict], cashflow_records: list[dict], *, evidence_ids: list[str] | None = None) -> MetricValue:
+    matched = _matched_annual([(income_records, ["operating_income"]), (cashflow_records, ["act_cash_flow_net", "pay_fixed_assets_etc_cash"])])
+    if not matched:
+        return MetricValue(metric="operating_cash_surplus_margin", value=None, unit="ratio", basis="annual_report",
+                           formula="(act_cash_flow_net - pay_fixed_assets_etc_cash) / operating_income", evidence_ids=evidence_ids or [],
+                           note="缺少同一报告期的年报经营投入字段；不将该指标称为自由现金流。")
+    period, (income, cashflow) = matched
+    return _ratio_metric("operating_cash_surplus_margin", cashflow["values"]["act_cash_flow_net"] - cashflow["values"]["pay_fixed_assets_etc_cash"], income["values"]["operating_income"], period=period, formula="(act_cash_flow_net - pay_fixed_assets_etc_cash) / operating_income", evidence_ids=evidence_ids or [], note="经营现金净余量率，不等同于完整 FCFF/FCFE。")
+
+
+def accrual_ratio(income_records: list[dict], balance_records: list[dict], cashflow_records: list[dict], *, evidence_ids: list[str] | None = None) -> MetricValue:
+    matched = _matched_annual([(income_records, ["net_profit"]), (balance_records, ["assets_total"]), (cashflow_records, ["act_cash_flow_net"])])
+    if not matched:
+        return MetricValue(metric="accrual_ratio", value=None, unit="ratio", basis="annual_report",
+                           formula="(net_profit - act_cash_flow_net) / assets_total", evidence_ids=evidence_ids or [],
+                           note="缺少同一报告期的年报利润、资产或经营现金流。")
+    period, (income, balance, cashflow) = matched
+    return _ratio_metric("accrual_ratio", income["values"]["net_profit"] - cashflow["values"]["act_cash_flow_net"], balance["values"]["assets_total"], period=period, formula="(net_profit - act_cash_flow_net) / assets_total", evidence_ids=evidence_ids or [])
+
+
+def receivable_pressure(records: list[dict], *, evidence_ids: list[str] | None = None) -> MetricValue:
+    rows = _annual(records, ["accounts_receivable", "operating_income"])
+    if not rows:
+        return MetricValue(metric="receivable_pressure", value=None, unit="ratio", basis="annual_report",
+                           formula="accounts_receivable / operating_income", evidence_ids=evidence_ids or [],
+                           note="缺少同一报告期的年报应收账款或营业收入。")
+    row = rows[0]
+    return _ratio_metric("receivable_pressure", row["values"]["accounts_receivable"], row["values"]["operating_income"], period=row["period"], formula="accounts_receivable / operating_income", evidence_ids=evidence_ids or [])
+
+
+def net_cash_position_ratio(records: list[dict], *, evidence_ids: list[str] | None = None) -> MetricValue:
+    rows = _annual(records, ["cash", "total_debt", "assets_total"])
+    if not rows:
+        return MetricValue(metric="net_cash_position_ratio", value=None, unit="ratio", basis="annual_report",
+                           formula="(cash - total_debt) / assets_total", evidence_ids=evidence_ids or [],
+                           note="缺少同一报告期的年报货币资金、负债合计或资产总计。")
+    row = rows[0]
+    return _ratio_metric("net_cash_position_ratio", row["values"]["cash"] - row["values"]["total_debt"], row["values"]["assets_total"], period=row["period"], formula="(cash - total_debt) / assets_total", evidence_ids=evidence_ids or [], note="total_debt 为负债合计，不等同于有息负债。")

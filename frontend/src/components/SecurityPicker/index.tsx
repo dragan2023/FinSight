@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Button, Input, List, Select, Space, Tag, Typography } from "antd";
+import { Button, Input, Select, Space, Tag, Typography } from "antd";
 import { useState } from "react";
 import {
   confirmTicker,
@@ -48,7 +48,7 @@ export default function SecurityPicker({ value, onChange }: SecurityPickerProps)
   };
 
   return (
-    <Space direction="vertical" style={{ width: "100%" }} size="middle">
+    <Space orientation="vertical" style={{ width: "100%" }} size="middle">
       <Space.Compact style={{ width: "100%" }}>
         <Input
           aria-label="标的检索"
@@ -73,35 +73,17 @@ export default function SecurityPicker({ value, onChange }: SecurityPickerProps)
         />
       )}
       {candidates.length > 0 && (
-        <List
-          size="small"
-          dataSource={candidates}
-          renderItem={(item) => (
-            <List.Item
-              actions={[
-                <Button
-                  key="confirm"
-                  size="small"
-                  loading={confirming === item.thscode}
-                  onClick={() => void confirm(item)}
-                >
-                  确认
-                </Button>,
-              ]}
-            >
-              <List.Item.Meta
-                title={
-                  <Space size="small">
-                    <span>{item.name}</span>
-                    <Typography.Text type="secondary">{item.thscode}</Typography.Text>
-                  </Space>
-                }
-                description={item.currency}
-              />
-              <Tag>{item.asset_type}</Tag>
-            </List.Item>
-          )}
-        />
+        <div className="security-candidates" role="list">
+          {candidates.map((item) => (
+            <div className="security-candidate" role="listitem" key={item.thscode}>
+              <div>
+                <Space size="small"><span>{item.name}</span><Typography.Text type="secondary">{item.thscode}</Typography.Text></Space>
+                <div><Typography.Text type="secondary">{item.currency}</Typography.Text> <Tag>{item.asset_type}</Tag></div>
+              </div>
+              <Button size="small" loading={confirming === item.thscode} onClick={() => void confirm(item)}>确认</Button>
+            </div>
+          ))}
+        </div>
       )}
       {selected && (
         <Typography.Text type="secondary">

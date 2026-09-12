@@ -30,11 +30,12 @@ from ..research.events import (
     task_snapshot,
 )
 from ..research.models import SupplementKind, TaskBudget
-from ..research.chat import ReportChatService
+from ..research.chat import OpenChatService, ReportChatService
 from ..research.reports import ReportStore
 from ..research.repository import ResearchRepository
 from ..research.runner import ResearchTaskManager
 from ..research.supplements import SupplementStore
+from ..research.scopes import validate_scope
 
 router = APIRouter(prefix="/api/research", tags=["research"])
 Manager = Annotated[ResearchTaskManager, Depends(research_manager)]
@@ -60,6 +61,7 @@ class ResearchTaskCreate(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     thscode: str | None = THSCODE_FIELD
     type: ResearchKind = "general"
+    scope: dict | None = None
     budget: BudgetInput | None = None
     model_profile_id: str | None = PROFILE_ID_FIELD
     client_request_id: str | None = Field(default=None, min_length=8, max_length=128)
@@ -89,7 +91,25 @@ class ChatInput(BaseModel):
     question: str = Field(min_length=1, max_length=6000)
     # Every web request requires the user's affirmative choice on this turn.
     use_web_search: bool = False
-    search_provider: Literal["bocha", "tavily"] = "bocha"
+    search_provider: Literal["bocha"] = "bocha"
+    model_profile_id: str | None = PROFILE_ID_FIELD
+
+
+class OpenChatTurn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=6000)
+
+
+class OpenChatInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=6000)
+    thscode: str | None = THSCODE_FIELD
+    history: list[OpenChatTurn] = Field(default_factory=list, max_length=12)
+    use_web_search: bool = False
+    search_provider: Literal["bocha"] = "bocha"
     model_profile_id: str | None = PROFILE_ID_FIELD
 
 
@@ -139,6 +159,14 @@ def _chat(request: Request) -> ReportChatService:
                              web_research=request.app.state.web_research)
 
 
+def _open_chat(request: Request) -> OpenChatService:
+    return OpenChatService(models=request.app.state.models,
+                           model_factory=request.app.state.model_factory,
+                           market=request.app.state.market,
+                           web_research=request.app.state.web_research,
+                           news=getattr(request.app.state, "rss", None))
+
+
 def _apply_idempotency(repository: ResearchRepository, client_request_id: str | None,
                        request_hash: str):
     """同 ID 同内容返回原任务；同 ID 不同内容 409。返回 (task, replayed)。"""
@@ -154,9 +182,17 @@ def _apply_idempotency(repository: ResearchRepository, client_request_id: str | 
 
 @router.post("/tasks")
 async def create_task(data: ResearchTaskCreate, manager: Manager, request: Request):
-    scope = {"type": data.type}
+    if data.scope is not None and data.thscode is not None:
+        raise AppError("validation", "新 scope 不能与旧 thscode 参数同时提供。", 422)
+    try:
+        # Legacy requests retain their persisted type verbatim so old reports and
+        # clients remain stable; tool routing maps it to the corresponding scope.
+        scope = validate_scope(data.scope) if data.scope is not None else {"type": data.type}
+    except ValueError as error:
+        raise AppError("validation", str(error), 422) from error
     if data.thscode:
         scope["thscode"] = data.thscode
+        scope["thscodes"] = [data.thscode]
     budget = _budget(data.budget)
     request_hash = _request_hash({"question": data.question, "scope": scope,
                                   "budget": budget.model_dump(),
@@ -250,6 +286,16 @@ async def ask_report(report_id: str, data: ChatInput, request: Request):
             "message": message.model_dump(mode="json")}
 
 
+@router.post("/ai-chat/messages")
+async def ask_open_chat(data: OpenChatInput, request: Request):
+    result = await _open_chat(request).ask(
+        question=data.question.strip(), thscode=data.thscode,
+        history=[item.model_dump() for item in data.history],
+        use_web_search=data.use_web_search, search_provider=data.search_provider,
+        model_profile_id=data.model_profile_id)
+    return result
+
+
 @router.post("/reports/{report_id}/supplements", status_code=201)
 def add_supplement(report_id: str, data: SupplementInput, manager: Manager, request: Request):
     store = SupplementStore(_repository(request))
@@ -312,7 +358,7 @@ def source_preview(task_id: str, manager: Manager, request: Request) -> dict:
             budget_note=f"预算 ≤ {task.budget.max_llm_requests} 次请求"),
         SourceFlowPreview(
             flow="web_search", enabled=web_search_enabled,
-            description="联网搜索（博查/Tavily；搜索摘要只作线索，不充当财报）",
+            description="联网搜索（博查付费 API；搜索摘要只作线索，不充当财报）",
             budget_note="本任务未授权联网搜索。" if not web_search_enabled
             else "已授权：在任务预算内执行。",
             requires_confirmation=web_search_enabled),

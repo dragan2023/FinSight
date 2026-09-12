@@ -70,6 +70,26 @@ class ResearchRepository:
             row = db.execute("SELECT * FROM security_identities WHERE thscode = ?", (thscode,)).fetchone()
         return SecurityIdentity.model_validate(dict(row)) if row else None
 
+    # --- market observations ------------------------------------------------
+    def save_market_observation(self, *, observation_id: str, observed_date: str, modules: list[str],
+                                summary: dict, evidence_ids: list[str], created_at: str,
+                                dashboard: dict | None = None) -> None:
+        with self._storage.connect() as db:
+            db.execute("INSERT INTO market_observations (id, observed_date, modules_json, summary_json, evidence_ids_json, dashboard_json, created_at) VALUES (?,?,?,?,?,?,?)",
+                       (observation_id, observed_date, _dump(modules), _dump(summary), _dump(evidence_ids), _dump(dashboard or {}), created_at))
+
+    def list_market_observations(self, observed_date: str | None = None, limit: int = 30) -> list[dict]:
+        query, args = "SELECT * FROM market_observations", []
+        if observed_date:
+            query += " WHERE observed_date = ?"; args.append(observed_date)
+        query += " ORDER BY created_at DESC LIMIT ?"; args.append(limit)
+        with self._storage.connect() as db:
+            rows = db.execute(query, args).fetchall()
+        return [{"id": row["id"], "date": row["observed_date"], "modules": _load(row["modules_json"]),
+                 "summary": _load(row["summary_json"]), "evidence_ids": _load(row["evidence_ids_json"]),
+                 "dashboard": _load(row["dashboard_json"]) or {},
+                 "created_at": row["created_at"]} for row in rows]
+
     # --- evidence -----------------------------------------------------------
     def insert_evidence(self, meta: EvidenceMeta, records: list[NormalizedRecord],
                         gaps: list[DataGap], duplicate_versions: int,
@@ -478,6 +498,27 @@ class ResearchRepository:
 
     def delete_watchlist(self, item_id: str) -> bool:
         with self._storage.connect() as db: return db.execute("DELETE FROM watchlist_entries WHERE id=?", (item_id,)).rowcount > 0
+
+    def insert_watchlist_observation(self, observation) -> None:
+        with self._storage.connect() as db:
+            db.execute(
+                "INSERT INTO watchlist_observations VALUES (?,?,?,?,?,?,?,?)",
+                (observation.id, observation.watchlist_item_id, observation.thscode,
+                 _dump(observation.snapshot), _dump(observation.anomalies), observation.price_evidence_id,
+                 observation.anomaly_evidence_id, observation.observed_at.isoformat()))
+
+    def latest_watchlist_observations(self):
+        from .watchlist_observation import WatchlistObservation
+        with self._storage.connect() as db:
+            rows = db.execute(
+                "SELECT o.* FROM watchlist_observations o JOIN ("
+                " SELECT watchlist_item_id, MAX(observed_at) observed_at FROM watchlist_observations GROUP BY watchlist_item_id"
+                ") latest ON latest.watchlist_item_id=o.watchlist_item_id AND latest.observed_at=o.observed_at"
+                " ORDER BY o.observed_at DESC").fetchall()
+        return [WatchlistObservation(id=row["id"], watchlist_item_id=row["watchlist_item_id"], thscode=row["thscode"],
+                                     snapshot=_load(row["snapshot_json"]) or {}, anomalies=_load(row["anomalies_json"]) or [],
+                                     price_evidence_id=row["price_evidence_id"], anomaly_evidence_id=row["anomaly_evidence_id"],
+                                     observed_at=datetime.fromisoformat(row["observed_at"])) for row in rows]
 
     def insert_thesis(self, item) -> None:
         with self._storage.connect() as db:

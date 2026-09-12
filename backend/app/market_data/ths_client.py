@@ -11,54 +11,34 @@ credentials are never logged or included in public messages.
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Callable
 
 import httpx
 
 from ..errors import AppError
+from .ths.contracts import contract_for_request, require_exclusive_window
+from .ths.transport import ThsTransport
+from .ths.index import IndexClient
+from .ths.auction import AuctionClient
+from .ths.special import SpecialDataClient
+from .ths.fund import FundClient
+from .ths.dumps import DumpClient
 from .models import (
     ADJUSTMENTS,
     ASSET_TYPES,
-    CODE_ASSET_TYPE_UNSUPPORTED,
-    CODE_DATA_NOT_READY,
-    CODE_OK,
-    CODE_PARAM_CONFLICT,
-    CODE_PARAM_OUT_OF_RANGE,
-    CODE_PERMISSION_DENIED,
-    CODE_RATE_LIMITED,
-    CODE_SERVICE_ERROR,
-    CODE_SOURCE_UNAVAILABLE,
-    CODE_TICKER_NOT_FOUND,
-    CODE_UNAUTHENTICATED,
-    CODE_UPSTREAM_TIMEOUT,
     DEFAULT_HISTORY_ADJUST,
     ENDPOINTS,
     EXCHANGES,
     Capability,
-    ConnectionFailed,
-    InvalidUpstreamResponse,
     MAX_BATCH_THSCODES,
     MAX_SEARCH_LIMIT,
     MAX_STATEMENT_LIMIT,
     HISTORY_WINDOW_CEILING_MS,
     INDICATOR_REPORT_PATTERN,
     PERIODS,
-    PermissionDenied,
-    RateLimited,
-    SourceDisabled,
-    SourceNotConfigured,
     STATEMENTS,
-    THS_ORIGIN,
     THSCODE_PATTERN,
-    UpstreamRejected,
-    UpstreamTimeout,
 )
-
-RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504}
-RETRY_CEILING_SECONDS = 10.0
-RETRY_BACKOFF_SECONDS = 0.5
-
 
 def _validation(message: str) -> AppError:
     return AppError("validation", message, 422)
@@ -101,86 +81,20 @@ class ThsClient:
         sleep: Callable[[float], object] = asyncio.sleep,
         max_retries: int = 2,
     ) -> None:
-        self._http = http
-        self._credential_source = credential_source
-        self._sleep = sleep
-        self._max_retries = max_retries
+        self._transport = ThsTransport(
+            http, credential_source=credential_source, sleep=sleep, max_retries=max_retries)
+        self.indices = IndexClient(self._transport)
+        self.auction = AuctionClient(self._transport)
+        self.special = SpecialDataClient(self._transport)
+        self.funds = FundClient(self._transport)
+        self.dumps = DumpClient(self._transport)
 
-    def _credential(self) -> str:
-        api_key, enabled = self._credential_source()
-        if not api_key:
-            raise SourceNotConfigured()
-        if not enabled:
-            raise SourceDisabled()
-        return api_key
-
-    async def _request(self, capability: Capability, path: str, params: dict) -> dict:
-        api_key = self._credential()
-        url = THS_ORIGIN + path
-        headers = {"Accept": "application/json", "X-api-key": api_key}
-        attempts = 0
-        while True:
-            attempts += 1
-            try:
-                response = await self._http.get(url, params=params, headers=headers)
-            except httpx.TimeoutException:
-                if attempts >= self._max_retries + 1:
-                    raise UpstreamTimeout() from None
-                await self._sleep(RETRY_BACKOFF_SECONDS * attempts)
-                continue
-            except httpx.TransportError:
-                if attempts >= self._max_retries + 1:
-                    raise ConnectionFailed() from None
-                await self._sleep(RETRY_BACKOFF_SECONDS * attempts)
-                continue
-            except asyncio.CancelledError:
-                raise
-            if response.status_code in (401, 403):
-                raise PermissionDenied()
-            if response.status_code in RETRYABLE_HTTP_STATUS or response.status_code >= 500:
-                if attempts >= self._max_retries + 1:
-                    if response.status_code == 429:
-                        raise RateLimited()
-                    raise InvalidUpstreamResponse("数据源持续返回不可用状态。")
-                await self._sleep(self._retry_delay(response))
-                continue
-            if response.status_code != 200:
-                raise InvalidUpstreamResponse()
-            try:
-                envelope = response.json()
-            except (json.JSONDecodeError, ValueError):
-                raise InvalidUpstreamResponse() from None
-            if not isinstance(envelope, dict) or not isinstance(envelope.get("code"), int):
-                raise InvalidUpstreamResponse()
-            code = envelope["code"]
-            if code == CODE_OK:
-                data = envelope.get("data")
-                if not isinstance(data, dict):
-                    raise InvalidUpstreamResponse()
-                return data
-            if code in (2001, CODE_PERMISSION_DENIED) or code in (401, 403):
-                raise PermissionDenied()
-            if code == CODE_RATE_LIMITED:
-                if attempts >= self._max_retries + 1:
-                    raise RateLimited()
-                await self._sleep(self._retry_delay(response))
-                continue
-            if code in (CODE_UPSTREAM_TIMEOUT, CODE_SOURCE_UNAVAILABLE, CODE_SERVICE_ERROR):
-                if attempts >= self._max_retries + 1:
-                    raise UpstreamTimeout() if code == CODE_UPSTREAM_TIMEOUT else InvalidUpstreamResponse("数据源暂时不可用。")
-                await self._sleep(self._retry_delay(response))
-                continue
-            raise UpstreamRejected(code)
+    async def _request(self, capability: Capability | str, path: str, params: dict) -> dict:
+        return await self._transport.request(contract_for_request(capability, path), params=params)
 
     @staticmethod
     def _retry_delay(response: httpx.Response) -> float:
-        raw = response.headers.get("Retry-After")
-        if raw:
-            try:
-                return min(float(raw), RETRY_CEILING_SECONDS)
-            except ValueError:
-                pass
-        return RETRY_BACKOFF_SECONDS
+        return ThsTransport.retry_delay(response)
 
     async def search(self, q: str, *, exchange: str | None = None,
                      asset_type: str | None = None, limit: int = 10) -> dict:
@@ -233,12 +147,8 @@ class ThsClient:
         code_value = validate_thscode(thscode)
         if period not in PERIODS:
             raise _validation("报告期类型仅支持 annual / quarterly。")
-        has_window = start_ms is not None or end_ms is not None
-        has_limit = limit is not None
-        if has_window != (start_ms is not None and end_ms is not None):
-            raise _validation("时间区间模式必须同时提供开始与结束时间。")
-        if has_window and has_limit:
-            raise _validation("最近 N 期与时间区间两种取数模式互斥。")
+        require_exclusive_window(limit=limit, start_ms=start_ms, end_ms=end_ms)
+        has_window = start_ms is not None
         params: dict = {"thscode": code_value, "period": period}
         if has_window:
             start, end = validate_ms_range(start_ms, end_ms, ceiling_ms=HISTORY_WINDOW_CEILING_MS)
@@ -262,3 +172,26 @@ class ThsClient:
         start, end = validate_ms_range(start_ms, end_ms)
         params = {"start": start, "end": end}
         return await self._request(Capability.TRADING_DAYS, ENDPOINTS[Capability.TRADING_DAYS], params)
+
+    async def ticker_list(self, *, asset_type: str | None = None, limit: int = 1000,
+                          offset: int = 0) -> dict:
+        if not 1 <= limit <= 10_000 or offset < 0:
+            raise _validation("标的列表分页参数不合法。")
+        params: dict = {"limit": limit, "offset": offset}
+        if asset_type:
+            params["asset_type"] = asset_type
+        return await self._request(Capability.TICKER_LIST, ENDPOINTS[Capability.TICKER_LIST], params)
+
+    async def adjustment_factors(self, thscode: str, *, start_ms: int | None = None,
+                                 end_ms: int | None = None) -> dict:
+        params: dict = {"thscode": validate_thscode(thscode)}
+        if start_ms is not None or end_ms is not None:
+            start, end = validate_ms_range(start_ms, end_ms)
+            params.update({"start": start, "end": end})
+        return await self._request(Capability.CORPORATE_ACTIONS, ENDPOINTS[Capability.CORPORATE_ACTIONS], params)
+
+    async def anomaly_analysis_stock(self, thscode: str, *, date_ms: int | None = None) -> dict:
+        code = validate_thscode(thscode)
+        # 同花顺当前定义为“当日个股异动原因”，参数为 thscodes；观察日仍由
+        # MarketDataService 的缓存键保存，但不属于上游请求参数。
+        return await self.special.stock_anomaly(code)

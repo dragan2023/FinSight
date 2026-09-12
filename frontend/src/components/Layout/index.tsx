@@ -1,8 +1,11 @@
 import {
   ArrowUpOutlined,
+  BookOutlined,
   CompassOutlined,
   ExperimentOutlined,
   FundOutlined,
+  MessageOutlined,
+  NotificationOutlined,
   SafetyCertificateOutlined,
   SettingOutlined,
 } from "@ant-design/icons";
@@ -42,6 +45,8 @@ export default function Layout() {
             <ExperimentOutlined aria-hidden />
             研究工作台
           </NavLink>
+          <NavLink to="/ai-chat" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><MessageOutlined aria-hidden />顾问工作台</NavLink>
+          <NavLink to="/strategy-lab" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><ExperimentOutlined aria-hidden />策略实验</NavLink>
           <NavLink to="/company" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><FundOutlined aria-hidden />公司体检</NavLink>
           <NavLink to="/compare" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><FundOutlined aria-hidden />同行比较</NavLink>
           <NavLink to="/watchlist" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><FundOutlined aria-hidden />关注与理由</NavLink>
@@ -49,6 +54,9 @@ export default function Layout() {
           <NavLink to="/sectors" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><FundOutlined aria-hidden />板块研究</NavLink>
           <NavLink to="/funds" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><FundOutlined aria-hidden />基金研究</NavLink>
           <NavLink to="/market-review" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><FundOutlined aria-hidden />市场复盘</NavLink>
+          <NavLink to="/market-explorer" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><FundOutlined aria-hidden />全市场观察</NavLink>
+          <NavLink to="/news" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><NotificationOutlined aria-hidden />新闻订阅</NavLink>
+          <NavLink to="/knowledge" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><BookOutlined aria-hidden />知识库</NavLink>
           <NavLink
             to="/settings"
             className={({ isActive }) =>
@@ -82,7 +90,8 @@ export default function Layout() {
               ? "模型与 API 配置"
               : location.pathname.startsWith("/research")
                 ? "研究工作台"
-                : location.pathname.startsWith("/company") ? "公司财务体检" : location.pathname.startsWith("/compare") ? "同行比较" : location.pathname.startsWith("/watchlist") ? "关注与理由" : location.pathname.startsWith("/library") ? "研究资产库" : location.pathname.startsWith("/sectors") ? "板块研究" : location.pathname.startsWith("/funds") ? "基金研究" : location.pathname.startsWith("/market-review") ? "市场复盘"
+                : location.pathname.startsWith("/ai-chat") ? "顾问工作台" : location.pathname.startsWith("/strategy-lab") ? "策略实验"
+                : location.pathname.startsWith("/company") ? "公司财务体检" : location.pathname.startsWith("/compare") ? "同行比较" : location.pathname.startsWith("/watchlist") ? "关注与理由" : location.pathname.startsWith("/library") ? "研究资产库" : location.pathname.startsWith("/sectors") ? "板块研究" : location.pathname.startsWith("/funds") ? "基金研究" : location.pathname.startsWith("/market-review") ? "市场复盘" : location.pathname.startsWith("/market-explorer") ? "全市场观察" : location.pathname.startsWith("/news") ? "新闻订阅" : location.pathname.startsWith("/knowledge") ? "知识库"
                 : "研究概览"}
           </div>
           <span className="local-badge">
@@ -95,6 +104,9 @@ export default function Layout() {
         </main>
         <footer className="page-footer">
           <span>FinSight · 让研究有据可循</span>
+          <span className="footer-disclaimer">
+            研究参考，不构成投资建议
+          </span>
           <span>只读研究，不提供交易功能</span>
         </footer>
       </div>

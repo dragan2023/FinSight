@@ -16,7 +16,7 @@ export default function ReportChat({ reportId }: { reportId: string }) {
   });
   return <Card title="继续追问" size="small">
     <Space orientation="vertical" size="middle" style={{ width: "100%" }}>
-      <Typography.Text type="secondary">围绕这份报告继续问。助手会结合报告、这段对话和你本次明确授权的联网搜索回答。</Typography.Text>
+      <Typography.Text type="secondary">围绕这份报告继续问。助手会结合报告、这段对话和你本次明确授权的联网搜索回答，也可给出带条件的买入、持有、卖出或观望观点。</Typography.Text>
       {history.error && <ErrorNotice error={history.error} retry={() => void history.refetch()} />}
       {(history.data?.messages ?? []).map(message => <div key={message.id}>
         <Typography.Text strong>{message.role === "user" ? "你" : "FinSight"}</Typography.Text>
@@ -29,6 +29,7 @@ export default function ReportChat({ reportId }: { reportId: string }) {
       {useWebSearch && <Alert type="info" showIcon title="仅本次追问会发送搜索关键词" description="搜索结果作为补充线索，不会替代报告内的已保存数据；未配置博查时不会发起请求。" />}
       {ask.error && <ErrorNotice error={ask.error} retry={() => ask.mutate()} />}
       <Button type="primary" loading={ask.isPending} disabled={!question.trim()} onClick={() => ask.mutate()}>发送追问</Button>
+      <Typography.Text type="secondary">本回答由 AI 结合可用数据综合分析得出，仅供参考；股市有风险，投资需谨慎。</Typography.Text>
     </Space>
   </Card>;
 }

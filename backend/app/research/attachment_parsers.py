@@ -20,9 +20,16 @@ from typing import Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..web_research.public_reader import has_pdf_magic
-
 PARSE_TIME_BUDGET_SECONDS = 60.0
+
+# PDF 魔数校验是附件解析的第一道内容闸门；只认文件头字节，扩展名与
+# Content-Type 永远不当成内容证明。（原实现随公开正文读取器一并按合规
+# 红线移除，魔数判断就近保留在附件解析内。）
+PDF_MAGIC = b"%PDF"
+
+
+def has_pdf_magic(data: bytes) -> bool:
+    return data.startswith(PDF_MAGIC)
 
 # 附件扩展名/MIME 白名单（双检的第二把尺子）；解析器与存储共用同一份定义。
 ALLOWED_EXTENSIONS = frozenset({"txt", "md", "markdown", "csv", "tsv", "xlsx", "pdf"})

@@ -11,7 +11,7 @@ from .settings import Settings
 # 仅附件上传路由允许受限 multipart（计划 04 §2.5）：会话/来源校验不变，
 # 请求体按实际流字节计数落盘 spool（内存上限 1 MiB，其余进临时文件），
 # 超过硬上限直接 413，绝不把现有全局 JSON/32 KiB 限制全部关闭。
-MULTIPART_UPLOAD_PATHS = frozenset({"/api/supplements/files"})
+MULTIPART_UPLOAD_PATHS = frozenset({"/api/supplements/files", "/api/market-warehouse/import"})
 _SPOOL_MEMORY_BYTES = 1024 * 1024
 UPLOAD_REPLAY_CHUNK_BYTES = 262144
 
@@ -73,7 +73,10 @@ class LocalSecurityMiddleware:
                         return
                     data = event.get("body", b"")
                     length += len(data)
-                    if length > self.settings.attachment_request_cap_bytes:
+                    cap = (self.settings.market_import_cap_bytes
+                           if path == "/api/market-warehouse/import"
+                           else self.settings.attachment_request_cap_bytes)
+                    if length > cap:
                         spool.close()
                         await reject("payload_too_large", "上传内容超过单次请求上限。", 413)
                         return

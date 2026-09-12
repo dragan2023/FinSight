@@ -33,7 +33,9 @@ from .models import (
     utc_now_iso,
 )
 
-BOCHA_ORIGIN = "https://api.bocha.cn"
+# 博查开放平台的 API 域名与官网不同；错误地使用 bocha.cn 会让有效的
+# Bearer Key 被非开放接口拒绝。
+BOCHA_ORIGIN = "https://api.bochaai.com"
 BOCHA_SEARCH_PATH = "/v1/web-search"
 RETRY_BACKOFF_SECONDS = 1.0
 RETRY_CEILING_SECONDS = 8.0
@@ -60,7 +62,10 @@ class BochaSearchClient:
             raise SearchSourceNotConfigured("bocha")
         if not enabled:
             raise SearchSourceDisabled()
-        return api_key
+        # 官方示例把 "Bearer " 写在 HTTP 头中。配置页允许用户直接粘贴
+        # 示例中的整段值，因此在客户端统一去掉一次前缀，避免发出
+        # "Authorization: Bearer Bearer ..." 而误判为权限不足。
+        return api_key.removeprefix("Bearer ").removeprefix("bearer ").strip()
 
     @staticmethod
     def _retry_delay(response: httpx.Response) -> float:
@@ -169,3 +174,25 @@ class BochaSearchClient:
         if dropped:
             warnings.append(f"已丢弃 {dropped} 条缺少标题或链接的结果。")
         return items, warnings
+
+    async def balance(self) -> None:
+        """Verify the documented balance endpoint without returning account data."""
+        headers = {"Accept": "application/json", "Authorization": "Bearer " + self._credential()}
+        try:
+            response = await self._http.get(BOCHA_ORIGIN + "/v1/fund/remaining", headers=headers)
+        except httpx.TimeoutException:
+            raise SearchUpstreamTimeout() from None
+        except httpx.TransportError:
+            raise SearchConnectionFailed() from None
+        if response.status_code == 401:
+            raise SearchUnauthenticated()
+        if response.status_code in (402, 403):
+            raise SearchPermissionDenied()
+        if response.status_code != 200:
+            raise SearchInvalidResponse()
+        try:
+            payload = response.json()
+        except (ValueError, TypeError):
+            raise SearchInvalidResponse() from None
+        if not isinstance(payload, dict) or payload.get("success") is not True or str(payload.get("code")) != "200":
+            raise SearchInvalidResponse("余额接口返回了无法解释的响应。")

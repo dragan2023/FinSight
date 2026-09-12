@@ -1,9 +1,125 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { Alert, Button, Input, Table, Tag } from "antd";
+import SecurityPickerModal from "../../components/SecurityPickerModal";
 import { compareCompanies, type ComparisonResult } from "../../api/company";
 import ErrorNotice from "../../components/ErrorNotice";
 
-const labels:Record<string,string>={revenue_yoy:"营收同比",net_profit_yoy:"归母同比",gross_margin:"毛利率",net_margin:"净利率",debt_ratio:"资产负债率",ocf_vs_parent_profit:"经营现金流/归母",pe_ttm:"PE TTM",pb_mrq:"PB"};
-export default function Compare(){const [raw,setRaw]=useState("");const mutation=useMutation({mutationFn:compareCompanies});const result=mutation.data?.comparison;return <><div className="page-heading"><div><div className="eyebrow">LOCAL PEER COMPARISON</div><h1>同行比较</h1><p>输入 2–10 个已确认标的；只使用本地证据，期间或口径不一致时不排序。</p></div></div><Input.TextArea value={raw} onChange={event=>setRaw(event.target.value.toUpperCase())} placeholder="600519.SH, 000858.SZ" autoSize={{minRows:2,maxRows:4}}/><Button type="primary" style={{marginTop:12}} loading={mutation.isPending} onClick={()=>mutation.mutate(raw.split(/[，,\s]+/).filter(Boolean))}>构建本地比较表</Button>{mutation.error&&<ErrorNotice error={mutation.error} retry={()=>mutation.mutate(raw.split(/[，,\s]+/).filter(Boolean))}/>} {result&&<Comparison table={result}/>}</>}
-function Comparison({table}:{table:ComparisonResult}){const metrics=Object.keys(table.rows[0]?.cells??{});return <><Alert style={{marginTop:20}} type={table.common_period?"info":"warning"} showIcon message={table.common_period?`共同报告期：${table.common_period}；有效样本 ${table.comparable_count}/${table.selected_count}`:"报告期或口径不一致，以下仅并列展示"} description={table.gaps.join(" ")||"任何排序仅限本比较组，不构成行业排名或投资建议。"}/><Table style={{marginTop:18}} rowKey={row=>row.company.thscode} pagination={false} dataSource={table.rows} columns={[{title:"公司",render:(_,row)=>`${row.company.name} · ${row.company.thscode}`},...metrics.map(metric=>({title:labels[metric]??metric,render:(_:unknown,row:ComparisonResult["rows"][number])=>{const cell=row.cells[metric];return cell.status==="available"?cell.value:<Tag>{cell.status==="not_applicable"?"不适用":"--"}</Tag>}}))]}/></>}
+const labels: Record<string, string> = {
+  revenue_yoy: "营收同比",
+  net_profit_yoy: "归母同比",
+  gross_margin: "毛利率",
+  net_margin: "净利率",
+  debt_ratio: "资产负债率",
+  ocf_vs_parent_profit: "经营现金流/归母",
+  pe_ttm: "PE TTM",
+  pb_mrq: "PB",
+};
+export default function Compare() {
+  const [raw, setRaw] = useState("");
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const mutation = useMutation({ mutationFn: compareCompanies });
+  const pickedCount = useMemo(
+    () => raw.split(/[，,\s]+/).filter(Boolean).length,
+    [raw],
+  );
+  const fillFromPicker = (picked: Array<{ thscode: string }>) => {
+    setRaw((previous) => {
+      const existing = previous.split(/[，,\s]+/).filter(Boolean);
+      return Array.from(
+        new Set([...existing, ...picked.map((item) => item.thscode)]),
+      ).join(", ");
+    });
+    setPickerOpen(false);
+  };
+  const result = mutation.data?.comparison;
+  return (
+    <>
+      <div className="page-heading">
+        <div>
+          <div className="eyebrow">LOCAL PEER COMPARISON</div>
+          <h1>同行比较</h1>
+          <p>
+            选择或输入 2–10
+            个已确认标的；只使用本地证据，期间或口径不一致时不排序。
+          </p>
+        </div>
+      </div>
+      <Input.TextArea
+        value={raw}
+        onChange={(event) => setRaw(event.target.value.toUpperCase())}
+        placeholder="600519.SH, 000858.SZ"
+        autoSize={{ minRows: 2, maxRows: 4 }}
+      />
+      <Button onClick={() => setPickerOpen(true)} disabled={pickedCount >= 10}>
+        从已确认标的选择（可多选）
+      </Button>
+      <Button
+        type="primary"
+        loading={mutation.isPending}
+        onClick={() => mutation.mutate(raw.split(/[，,\s]+/).filter(Boolean))}
+      >
+        构建本地比较表
+      </Button>
+      {pickedCount > 0 ? <Tag>已选 {pickedCount} / 10</Tag> : null}
+      {mutation.error && (
+        <ErrorNotice
+          error={mutation.error}
+          retry={() => mutation.mutate(raw.split(/[，,\s]+/).filter(Boolean))}
+        />
+      )}
+      <SecurityPickerModal
+        open={pickerOpen}
+        multiple
+        assetTypes={["a-share"]}
+        onCancel={() => setPickerOpen(false)}
+        onConfirm={fillFromPicker}
+      />
+      {result && <Comparison table={result} />}
+    </>
+  );
+}
+function Comparison({ table }: { table: ComparisonResult }) {
+  const metrics = Object.keys(table.rows[0]?.cells ?? {});
+  return (
+    <>
+      <Alert
+        style={{ marginTop: 20 }}
+        type={table.common_period ? "info" : "warning"}
+        showIcon
+        title={
+          table.common_period
+            ? `共同报告期：${table.common_period}；有效样本 ${table.comparable_count}/${table.selected_count}`
+            : "报告期或口径不一致，以下仅并列展示"
+        }
+        description={
+          table.gaps.join(" ") ||
+          "任何排序仅限本比较组，不构成行业排名或投资建议。"
+        }
+      />
+      <Table
+        style={{ marginTop: 18 }}
+        rowKey={(row) => row.company.thscode}
+        pagination={false}
+        dataSource={table.rows}
+        columns={[
+          {
+            title: "公司",
+            render: (_, row) => `${row.company.name} · ${row.company.thscode}`,
+          },
+          ...metrics.map((metric) => ({
+            title: labels[metric] ?? metric,
+            render: (_: unknown, row: ComparisonResult["rows"][number]) => {
+              const cell = row.cells[metric];
+              return cell.status === "available" ? (
+                cell.value
+              ) : (
+                <Tag>{cell.status === "not_applicable" ? "不适用" : "--"}</Tag>
+              );
+            },
+          })),
+        ]}
+      />
+    </>
+  );
+}

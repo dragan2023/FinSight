@@ -6,13 +6,14 @@ import {
   ImportOutlined,
 } from "@ant-design/icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Alert, App, Button, Popconfirm, Skeleton, Space, Tag } from "antd";
+import { Alert, App, Button, Dropdown, Popconfirm, Skeleton, Space, Tag } from "antd";
 import {
   deleteIntegrationProfile,
   getIntegrations,
   getIntegrationProfiles,
   importEnvironment,
   statusLabels,
+  testIntegrationProfile,
 } from "../../api/apiConfig";
 import type {
   IntegrationCategory,
@@ -30,7 +31,7 @@ const categoryTitles: Record<IntegrationCategory, { title: string; hint: string 
   },
   web_search: {
     title: "联网搜索",
-    hint: "用于公告、监管与经营解释的网页发现与正文提取；默认不发送私人材料。",
+    hint: "博查付费官方 API：公告、监管与经营解释的网页发现；默认不发送私人材料。",
   },
   local: {
     title: "本地解析",
@@ -80,6 +81,14 @@ export default function ApiProviders({ category }: { category: IntegrationCatego
       void message.success("环境配置已加密导入");
     },
   });
+  const testCapability = useMutation({
+    mutationFn: ({ profile, capability }: { profile: IntegrationProfile; capability: string }) =>
+      testIntegrationProfile(profile.id, capability),
+    onSuccess: async (result) => {
+      await queryClient.invalidateQueries({ queryKey: ["integration-profiles"] });
+      void message.success(result.message);
+    },
+  });
   const specs = (catalog.data?.providers ?? []).filter(
     (item) => item.category === category,
   );
@@ -116,6 +125,7 @@ export default function ApiProviders({ category }: { category: IntegrationCatego
       {profiles.error && <ErrorNotice error={profiles.error} />}
       {remove.error && <ErrorNotice error={remove.error} />}
       {importFinance.error && <ErrorNotice error={importFinance.error} />}
+      {testCapability.error && <ErrorNotice error={testCapability.error} />}
       {financeImportable && (
         <Alert
           className="settings-alert"
@@ -170,9 +180,10 @@ export default function ApiProviders({ category }: { category: IntegrationCatego
                   </p>
                 )}
                 <div className="capability-tags">
-                  {spec.capabilities.map((capability) => (
-                    <Tag key={capability.id}>{capability.name}</Tag>
-                  ))}
+                  {spec.capabilities.map((capability) => {
+                    const status = list.flatMap((profile) => profile.tests).find((test) => test.capability === capability.id)?.status;
+                    return <Tag key={capability.id} color={status === "ok" ? "success" : status ? "warning" : capability.implementation === "planned" ? "default" : "processing"}>{capability.name} · {status === "ok" ? "已验证" : status ? "受限" : capability.implementation === "planned" ? "未实现" : "未验证"}</Tag>;
+                  })}
                 </div>
                 {list.length === 0 ? (
                   <Button
@@ -206,6 +217,26 @@ export default function ApiProviders({ category }: { category: IntegrationCatego
                           : " · 尚无能力测试记录"}
                       </p>
                       <Space wrap>
+                        <Dropdown
+                          disabled={planned || !profile.enabled || profile.key_status !== "configured"}
+                          menu={{
+                            items: spec.capabilities.map((capability) => ({
+                              key: capability.id,
+                              label: `验证：${capability.name}`,
+                              disabled: capability.implementation === "planned",
+                            })),
+                            onClick: ({ key }) => testCapability.mutate({
+                              profile,
+                              capability: key,
+                            }),
+                          }}
+                        >
+                          <Button
+                            loading={testCapability.isPending && testCapability.variables?.profile.id === profile.id}
+                          >
+                            选择能力验证（可能计费）
+                          </Button>
+                        </Dropdown>
                         <Button
                           icon={<EditOutlined aria-hidden />}
                           disabled={!writable}

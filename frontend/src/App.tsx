@@ -11,6 +11,12 @@ const Watchlist = lazy(() => import("./pages/Watchlist"));
 const Library = lazy(() => import("./pages/Library"));
 const Compare = lazy(() => import("./pages/Compare"));
 const MarketResearch = lazy(() => import("./pages/MarketResearch"));
+const Funds = lazy(() => import("./pages/Funds"));
+const MarketExplorer = lazy(() => import("./pages/MarketExplorer"));
+const AIChat = lazy(() => import("./pages/AIChat"));
+const News = lazy(() => import("./pages/News"));
+const Knowledge = lazy(() => import("./pages/Knowledge"));
+const StrategyLab = lazy(() => import("./pages/StrategyLab"));
 
 export default function App() {
   return (
@@ -43,13 +49,18 @@ export default function App() {
                 </Suspense>
               }
             />
+            <Route path="ai-chat" element={<Suspense fallback={<Skeleton active />}><AIChat /></Suspense>} />
             <Route path="company" element={<Suspense fallback={<Skeleton active />}><Company /></Suspense>} />
             <Route path="watchlist" element={<Suspense fallback={<Skeleton active />}><Watchlist /></Suspense>} />
             <Route path="library" element={<Suspense fallback={<Skeleton active />}><Library /></Suspense>} />
             <Route path="compare" element={<Suspense fallback={<Skeleton active />}><Compare /></Suspense>} />
             <Route path="sectors" element={<Suspense fallback={<Skeleton active />}><MarketResearch kind="sectors" /></Suspense>} />
-            <Route path="funds" element={<Suspense fallback={<Skeleton active />}><MarketResearch kind="funds" /></Suspense>} />
+            <Route path="funds" element={<Suspense fallback={<Skeleton active />}><Funds /></Suspense>} />
             <Route path="market-review" element={<Suspense fallback={<Skeleton active />}><MarketResearch kind="market" /></Suspense>} />
+            <Route path="market-explorer" element={<Suspense fallback={<Skeleton active />}><MarketExplorer /></Suspense>} />
+            <Route path="news" element={<Suspense fallback={<Skeleton active />}><News /></Suspense>} />
+            <Route path="knowledge" element={<Suspense fallback={<Skeleton active />}><Knowledge /></Suspense>} />
+            <Route path="strategy-lab" element={<Suspense fallback={<Skeleton active />}><StrategyLab /></Suspense>} />
             <Route
               path="settings"
               element={

@@ -67,9 +67,15 @@ export async function request<T>(
   config: AxiosRequestConfig,
   isPublic = false,
 ): Promise<T> {
+  const method = (config.method ?? "GET").toUpperCase();
+  const isJsonWrite = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
   const send = async () =>
     client.request<T>({
       ...config,
+      // Axios removes Content-Type from bodyless writes.  The backend security
+      // contract requires every non-multipart write to carry JSON, so send an
+      // explicit empty object for command-style endpoints such as RSS refresh.
+      ...(isJsonWrite && config.data === undefined ? { data: {} } : {}),
       headers: {
         "Content-Type": "application/json",
         ...(!isPublic ? { "X-FinSight-Session": await getSession() } : {}),

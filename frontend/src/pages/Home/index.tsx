@@ -13,6 +13,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { systemQuery } from "../../api/system";
 import DataPreview from "../../components/DataPreview";
 import ErrorNotice from "../../components/ErrorNotice";
+import SourcesPanel from "../../components/SourcesPanel";
 
 export default function Home() {
   const navigate = useNavigate();
@@ -150,6 +151,11 @@ export default function Home() {
           </div>
         </section>
       </div>
+      <div className="section-heading">
+        <h2>数据来源</h2>
+        <span>当前注册的研究数据来源、可信级别与本机启用状态</span>
+      </div>
+      <SourcesPanel />
       <section className="section-heading">
         <h2>选标的、取研究资料</h2>
         <span>检索同花顺代码表，确认标的后获取快照、日线、估值与三表</span>

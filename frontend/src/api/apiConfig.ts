@@ -14,6 +14,7 @@ export type ProfileStatus =
 export interface IntegrationCapability {
   id: string;
   name: string;
+  implementation?: "planned" | "available";
 }
 export interface IntegrationSpec {
   id: string;
@@ -91,6 +92,12 @@ export const deleteIntegrationProfile = (id: string, version: number) =>
     url: `/integrations/profiles/${id}?credential_version=${version}`,
     method: "DELETE",
     data: {},
+  });
+export const testIntegrationProfile = (id: string, capability: string) =>
+  request<IntegrationTest>({
+    url: `/integrations/profiles/${id}/test`,
+    method: "POST",
+    data: { capability, confirm_external: true },
   });
 export const importEnvironment = (service: "finance" | "llm") =>
   request<ImportedResult>({

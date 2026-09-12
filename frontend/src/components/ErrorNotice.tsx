@@ -16,10 +16,6 @@ export default function ErrorNotice({
       title={detail.message}
       description={
         <Space orientation="vertical" size={4}>
-          <span className="error-detail">
-            {detail.category}
-            {detail.request_id ? ` · 请求编号 ${detail.request_id}` : ""}
-          </span>
           {retry && (
             <Button size="small" onClick={retry}>
               重试

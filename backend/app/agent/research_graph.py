@@ -22,6 +22,7 @@ checkpoint；SQLite 只存业务进度、证据与公开结果。
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -39,6 +40,7 @@ from ..research.models import RawSectionText, TaskBudget, TaskUsage
 from .json_parser import JsonRejected, parse_complete_section_objects, parse_section_object
 from .output_models import (
     SECTION_TEMPLATES,
+    ChartSpec,
     Coverage,
     MetricValue,
     ModelSnapshot,
@@ -49,12 +51,10 @@ from .output_models import (
 )
 from .output_validation import ValidationContext, validate_report
 from .prompts import (
-    NATURAL_LANGUAGE_SYSTEM,
     SECTION_SYSTEM,
     TOOL_COLLECTION_RULES,
     content_regen_user,
     format_repair_user,
-    recovery_user,
     section_user,
     tool_collection_user,
 )
@@ -68,7 +68,8 @@ from .state import (
     new_usage,
     remaining,
 )
-from .tools import TEMPLATE_FETCH_PLAN, TOOL_SCHEMAS, ToolExecutor, compute_metric_set
+from .tools import ToolExecutor, compute_metric_set, template_fetch_plan_for_scope
+from .toolsets import names_for_scope, schemas_for_scope
 
 MAX_MATERIALS_CHARS = 9000
 MAX_NOTICES = 64
@@ -109,6 +110,10 @@ class FactoryModelAdapter:
         self._factory = factory
         self._profile = profile
         self._profile_id = profile_id
+
+    @property
+    def profile_id(self) -> str | None:
+        return self._profile_id
 
     @property
     def mode(self) -> str:
@@ -169,14 +174,17 @@ class FactoryModelAdapter:
 class ResearchGraph:
     """一次任务运行一个实例；不配置任何 checkpoint，不落盘模型会话状态。"""
 
-    def __init__(self, *, market, model, tasks, reports, supplements=None,
-                 budget: TaskBudget | None = None, now: datetime | None = None,
-                 event_sink=None) -> None:
+    def __init__(self, *, market, model, tasks, reports, supplements=None, warehouse=None,
+                 news=None, knowledge=None, budget: TaskBudget | None = None,
+                 now: datetime | None = None, event_sink=None) -> None:
         self._market = market
         self._model = model
         self._tasks = tasks
         self._reports = reports
         self._supplements = supplements
+        self._warehouse = warehouse
+        self._news = news
+        self._knowledge = knowledge
         self._budget = budget or TaskBudget(max_llm_requests=DEFAULT_BUDGET["max_llm_requests"],
                                             max_fetches=DEFAULT_BUDGET["max_fetches"],
                                             max_tool_rounds=DEFAULT_BUDGET["max_tool_rounds"])
@@ -233,7 +241,7 @@ class ResearchGraph:
     # -- node: 身份确认 -------------------------------------------------------
     async def _confirm_identity(self, state: ResearchState) -> dict:
         scope = state.get("scope") or {}
-        thscode = scope.get("thscode")
+        thscode = scope.get("thscode") or next(iter(scope.get("thscodes") or []), None)
         identity = None
         gaps: list[dict] = []
         if thscode and self._market is not None:
@@ -241,13 +249,16 @@ class ResearchGraph:
                 identity = self._market.require_identity(thscode).model_dump()
             except AppError:
                 identity = None
-        if identity is None:
+        needs_identity = scope.get("type", "general") not in {"general", "market_pulse", "market_breadth"}
+        if identity is None and needs_identity:
             gaps.append(DataGap(
                 id=uuid.uuid4().hex, dimension="identity", fields=["thscode"],
                 security_id=None, period=None, reason="not_configured",
                 impact="标的身份未确认，结构化取数无法进行；报告将基于问题给出条件分析框架与取证清单。",
                 remedies=["先在资料预览中检索并确认标的，再重新发起分析。"]).model_dump())
-        detail = f"标的已确认：{identity['thscode']}。" if identity else "标的身份未确认；继续生成分析框架。"
+        detail = (f"标的已确认：{identity['thscode']}。" if identity
+                  else ("本研究范围不要求单一标的身份。" if not needs_identity
+                        else "标的身份未确认；继续生成分析框架。"))
         notice = {"type": "phase", "phase": "identity", "detail": detail}
         self._emit(task_id := state["task_id"], [notice])
         return {"identity": identity, "gaps": gaps,
@@ -256,25 +267,24 @@ class ResearchGraph:
     # -- node: 证据收集 -------------------------------------------------------
     async def _collect_evidence(self, state: ResearchState) -> dict:
         base_notices = list(state.get("notices") or [])
-        if self.mode == MODE_NONE:
-            notice = {"type": "phase", "phase": "collect",
-                      "detail": "没有可用模型，跳过取数与 AI 分析；仅保留本地计算与缺口。"}
-            self._emit(state["task_id"], [notice])
-            return {"notices": base_notices + [notice]}
-        executor = ToolExecutor(market=self._market, identity=state.get("identity"),
+        executor = ToolExecutor(market=self._market, warehouse=self._warehouse, news=self._news,
+                                knowledge=self._knowledge, identity=state.get("identity"),
                                 usage=state.get("usage") or new_usage(),
-                                budget=state.get("budget") or DEFAULT_BUDGET, now=self._now)
+                                budget=state.get("budget") or DEFAULT_BUDGET, now=self._now,
+                                allowed_tools=names_for_scope(state.get("scope") or {}))
         usage = executor.usage
         notices: list[dict] = []
-        if self.mode == MODE_TEMPLATE:
-            for name, args in TEMPLATE_FETCH_PLAN:
+        if self.mode in (MODE_TEMPLATE, MODE_NONE):
+            for name, args in template_fetch_plan_for_scope(state.get("scope") or {}, self._now):
                 outcome = await executor.execute_program(name, args)
                 if outcome["status"] == "error" and outcome["error"]["reason"] == "budget_exhausted":
                     notices.append({"type": "phase", "phase": "collect",
                                     "detail": "取数预算已用尽，固定模板提前结束。"})
                     break
             notices.append({"type": "phase", "phase": "collect",
-                            "detail": "所选模型不支持结构化工具调用，已按固定模板取数（能力降级）。"})
+                            "detail": ("所选模型不支持结构化工具调用，已按固定模板取数（能力降级）。"
+                                       if self.mode == MODE_TEMPLATE
+                                       else "没有可用模型，已按本领域固定计划取数并保留事实与缺口。")})
         else:
             notices += await self._tool_loop(state, executor, usage)
         self._emit(state["task_id"], notices)
@@ -285,8 +295,9 @@ class ResearchGraph:
 
     async def _tool_loop(self, state: ResearchState, executor: ToolExecutor, usage: dict) -> list[dict]:
         budget = state.get("budget") or DEFAULT_BUDGET
-        # 预留：正文分析每个模板章节至少 1 次请求，不得被取数吃掉。
-        evidence_budget = remaining(budget, usage, "llm_requests") - len(SECTION_TEMPLATES)
+        # 预留：每章至少一次正式分析，另为 JSON 异常预留一次自然语言重写，
+        # 不让取数阶段消耗掉用户可读正文所需的请求额度。
+        evidence_budget = remaining(budget, usage, "llm_requests") - (2 * len(SECTION_TEMPLATES))
         rounds_left = remaining(budget, usage, "tool_rounds")
         if evidence_budget < 1:
             return [{"type": "phase", "phase": "collect",
@@ -298,7 +309,7 @@ class ResearchGraph:
         ]
         notices: list[dict] = []
         while evidence_budget >= 1 and rounds_left >= 1:
-            turn = await self._model.turn(messages, tools=TOOL_SCHEMAS)
+            turn = await self._model.turn(messages, tools=schemas_for_scope(state.get("scope") or {}))
             usage["llm_requests"] = int(usage.get("llm_requests", 0)) + 1
             reasoning = self._reasoning_notice(usage, turn)
             if reasoning:
@@ -389,15 +400,16 @@ class ResearchGraph:
     async def _process_section(self, template, state, materials, turn: TurnResult,
                                usage: dict, budget: dict, context: ValidationContext,
                                raw_sections: list, section_states: dict):
-        """处理一轮输出：错误 → 不可用；截断 → 一次恢复；结构异常 → 自然语言降级。"""
+        """处理一轮输出：错误 → 不可用；截断或 Markdown 标记异常 → 重写正文。"""
         section_id = template["id"]
         st = {"integrity": "validated", "format_repair_used": False,
               "content_regen_used": False, "recovery_used": False}
         section_states[section_id] = st
         if turn.error is not None:
-            # 模型请求失败（鉴权/过滤/限流等）是独立问题：不重试绕过，保留说明。
-            st["integrity"] = "missing"
-            return self._placeholder(template, f"本节未生成：{turn.error['message']}"), st["integrity"]
+            # 预留的一次正文重写也用于瞬时模型错误；这样正常的短暂失败不会留下
+            # “本节未生成”的空洞卡片。
+            return await self._repair_format(template, state, materials, turn, usage, budget,
+                                             context, raw_sections, st)
         if turn.incomplete:
             return await self._recover_section(template, state, materials, turn, usage, budget,
                                                context, raw_sections, st)
@@ -420,39 +432,10 @@ class ResearchGraph:
             st["integrity"] = "partial_recovered"
             return await self._accept_section(template, recovered, state, materials, usage, budget,
                                               context, raw_sections, st, failed_turn.content)
-        # No complete structure exists, so use the existing one-shot rewrite.
-        if st["recovery_used"] or not can_spend(budget, usage, "llm_requests"):
-            raw_sections.append({"id": section_id, "title": template["title"],
-                                 "reason": "truncated_no_recovery", "text": failed_turn.content or "（无内容）"})
-            st["integrity"] = "incomplete"
-            return self._placeholder(
-                template, "本节输出被截断且未能自动恢复；原始文本可展开查看，可手动继续该节。"), st["integrity"]
-        st["recovery_used"] = True
-        messages = [
-            {"role": "system", "content": SECTION_SYSTEM},
-            {"role": "user", "content": recovery_user(state["question"], state.get("scope") or {},
-                                                      template, materials)},
-        ]
-        turn = await self._model.turn(messages)
-        _spend(usage, "llm_requests")
-        usage["reasoning_chars"] += turn.reasoning_chars
-        if turn.error is not None:
-            raw_sections.append({"id": section_id, "title": template["title"],
-                                 "reason": "recovery_model_error", "text": failed_turn.content or "（无内容）"})
-            st["integrity"] = "incomplete"
-            return self._placeholder(template, f"本节被截断且恢复请求失败：{turn.error['message']}"), st["integrity"]
-        if turn.incomplete:
-            raw_sections.append({"id": section_id, "title": template["title"],
-                                 "reason": "truncated_after_recovery", "text": turn.content or "（无内容）"})
-            st["integrity"] = "incomplete"
-            return self._placeholder(
-                template, "本节输出再次被截断；自动恢复已用尽，可手动继续该节。"), st["integrity"]
-        section, parse_error = self._parse_section(template, turn.content)
-        if parse_error is not None:
-            return await self._repair_format(template, state, materials, turn, usage, budget,
-                                             context, raw_sections, st)
-        return await self._accept_section(template, section, state, materials, usage, budget,
-                                          context, raw_sections, st, turn.content)
+        # 截断且没有完整对象时，不再重写 JSON。保留可解析的完整前缀后，直接让
+        # 模型基于同一材料重写用户可读正文，避免又得到半截 JSON。
+        return await self._repair_format(template, state, materials, failed_turn, usage, budget,
+                                         context, raw_sections, st)
 
     async def _repair_format(self, template, state, materials, failed_turn: TurnResult,
                              usage: dict, budget: dict, context: ValidationContext,
@@ -465,9 +448,10 @@ class ResearchGraph:
             return self._placeholder(template, "本节未能生成可核验的正文，已保留其他章节内容。"), st["integrity"]
         st["format_repair_used"] = True
         messages = [
-            {"role": "system", "content": NATURAL_LANGUAGE_SYSTEM},
-            {"role": "user", "content": format_repair_user(template, failed_turn.content,
-                                                           "输出不是符合契约的单个 JSON 对象")},
+            {"role": "system", "content": SECTION_SYSTEM},
+            {"role": "user", "content": format_repair_user(
+                state["question"], state.get("scope") or {}, template, materials,
+                failed_turn.content, "未找到完整的 Markdown 标题")},
         ]
         turn = await self._model.turn(messages)
         _spend(usage, "llm_requests")
@@ -477,10 +461,20 @@ class ResearchGraph:
                                  "reason": "repair_failed", "text": failed_turn.content})
             st["integrity"] = "unstructured"
             return self._placeholder(template, "本节未能生成可核验的正文，已保留其他章节内容。"), st["integrity"]
-        # JSON 不可读时不再进行第二次 JSON 修复。模型直接把可确认内容改写成
-        # 用户可读的正文；原始片段仅留在下载核验材料中，绝不进入报告页面。
-        st["integrity"] = "natural_language"
-        return self._natural_language_section(template, turn.content), st["integrity"]
+        section, parse_error = self._parse_section(template, turn.content)
+        if parse_error is None:
+            st["integrity"] = "markdown_rewritten"
+            return await self._accept_section(template, section, state, materials, usage, budget,
+                                              context, raw_sections, st, turn.content)
+        # 即使 Markdown 标题再次丢失，只要模型给的是自然语言，仍将其作为本节
+        # 正文显示；不能把格式错误或原始 JSON 展示给用户。
+        if not turn.content.lstrip().startswith("{"):
+            st["integrity"] = "markdown_rewritten"
+            return self._natural_language_section(template, turn.content), st["integrity"]
+        raw_sections.append({"id": section_id, "title": template["title"],
+                             "reason": "markdown_rewrite_invalid", "text": turn.content})
+        st["integrity"] = "unstructured"
+        return self._placeholder(template, "本节分析暂未生成，其他章节仍可正常阅读。"), st["integrity"]
 
     async def _accept_section(self, template, section: ReportSection, state, materials,
                               usage: dict, budget: dict, context: ValidationContext,
@@ -541,6 +535,7 @@ class ResearchGraph:
             parent_report_id=state.get("parent_report_id"),
             evidence_ids=sorted((state.get("evidence_index") or {})),
             metrics=[MetricValue.model_validate(m) for m in state.get("metrics") or []],
+            chart_specs=self._chart_specs(state.get("metrics") or [], state.get("scope") or {}),
             sections=[ReportSection.model_validate(s) for s in state.get("sections") or []],
             data_gaps=[DataGap.model_validate(g) for g in state.get("gaps") or []],
             coverage=coverage, output_integrity=integrity, limitations=limitations)
@@ -596,13 +591,39 @@ class ResearchGraph:
             id="draft", version=1, task_id=state["task_id"], question=state["question"],
             scope=dict(state.get("scope") or {}),
             metrics=[MetricValue.model_validate(m) for m in state.get("metrics") or []],
+            chart_specs=self._chart_specs(state.get("metrics") or [], state.get("scope") or {}),
             sections=sections,
             data_gaps=[DataGap.model_validate(g) for g in state.get("gaps") or []],
             coverage=Coverage.PARTIAL, output_integrity=OutputIntegrity.PARTIAL)
 
+    @staticmethod
+    def _chart_specs(metrics: list[dict], scope: dict | None = None) -> list[ChartSpec]:
+        """Generate display-only specs from deterministic metric IDs, never LLM text."""
+        refs = [str(item.get("metric")) for item in metrics
+                if item.get("metric") and item.get("value") is not None]
+        if not refs:
+            return []
+        primary = ChartSpec(id="deterministic-metrics", chart_type="bar",
+                            title="确定性指标对比", metric_refs=refs[:16])
+        return [primary, ChartSpec(
+            id="research-dashboard", chart_type="panel_grid", title="研究指标看板",
+            panel_grid={"columns": 12, "cells": [
+                {"row": 0, "column": 0, "row_span": 1, "column_span": 12,
+                 "component": "metrics", "title": "关键数据"},
+                {"row": 1, "column": 0, "row_span": 2, "column_span": 8,
+                 "component": "chart", "reference": "deterministic-metrics", "title": "指标对比"},
+                {"row": 1, "column": 8, "row_span": 2, "column_span": 4,
+                 "component": "gaps", "title": "数据缺口"},
+            ]})]
+
     def _parse_section(self, template, text: str):
         if not text or not text.strip():
             return None, "模型没有返回内容"
+        markdown = self._parse_markdown_section(template, text)
+        if markdown is not None:
+            return markdown, None
+        # 仅兼容已保存的历史模型输出或升级期间的旧响应；新提示词和正常运行路径
+        # 均只使用 Markdown，不把 JSON 作为报告正文协议。
         try:
             obj, _cleanups = parse_section_object(text, max_bytes=32768)
         except JsonRejected as error:
@@ -613,6 +634,39 @@ class ResearchGraph:
             return ReportSection.model_validate(obj), None
         except ValidationError:
             return None, "章节字段不符合报告契约"
+
+    @staticmethod
+    def _parse_markdown_section(template, text: str) -> ReportSection | None:
+        cleaned = text.strip().removeprefix("```markdown").removeprefix("```").removesuffix("```").strip()
+        if cleaned.startswith("{"):
+            return None
+        heading = re.compile(r"^##\s+(核心结论|结论|分析依据|分析|风险与待核验|风险提示|待核验)\s*$", re.MULTILINE)
+        matches = list(heading.finditer(cleaned))
+        if not matches:
+            return None
+        blocks: dict[str, str] = {}
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(cleaned)
+            blocks[match.group(1)] = cleaned[match.end():end].strip()
+        conclusion = blocks.get("核心结论") or blocks.get("结论") or ""
+        analysis = blocks.get("分析依据") or blocks.get("分析") or ""
+        risks = blocks.get("风险与待核验") or blocks.get("风险提示") or blocks.get("待核验") or ""
+        if not conclusion:
+            return None
+
+        def lines(value: str) -> list[str]:
+            return [item.strip(" -•\t") for item in value.splitlines() if item.strip(" -•\t")]
+
+        claim_lines = lines(analysis)
+        risk_lines = lines(risks)
+        if not claim_lines:
+            claim_lines = [conclusion]
+        return ReportSection(
+            id=template["id"], title=template["title"], status=SectionStatus.CONDITIONAL,
+            summary=conclusion[:2000],
+            claims=[{"kind": "inference", "text": item[:1200]} for item in claim_lines[:12]],
+            follow_up_questions=risk_lines[:8],
+        )
 
     @staticmethod
     def _recover_complete_prefix(template, text: str) -> ReportSection | None:
@@ -713,7 +767,12 @@ class ResearchGraph:
         valuation_ok = bool(records.get("valuation"))
         if financial_ok and price_ok and valuation_ok:
             return Coverage.SUFFICIENT
-        if financial_ok or price_ok or valuation_ok:
+        # Company coverage requires the three established fact groups above,
+        # while index/market/fund/warehouse scopes contribute records under
+        # their own domain keys.  Those records are valid business evidence
+        # too; reporting them as "no_business_evidence" would hide a useful
+        # partial result merely because it is not a single-stock study.
+        if financial_ok or price_ok or valuation_ok or any(records.values()):
             return Coverage.PARTIAL
         return Coverage.NO_BUSINESS_EVIDENCE
 
@@ -726,9 +785,9 @@ class ResearchGraph:
         elif any(item.get("integrity") == "unstructured" for item in states):
             integrity = OutputIntegrity.UNSTRUCTURED
             limitations.append("部分章节未能生成可核验的正文，已保留其他章节内容。")
-        elif any(item.get("integrity") == "natural_language" for item in states):
+        elif any(item.get("integrity") in {"natural_language", "markdown_rewritten"} for item in states):
             integrity = OutputIntegrity.PARTIAL
-            limitations.append("部分章节以自然语言方式生成；其中的结论应结合数据范围与待核验事项阅读。")
+            limitations.append("部分章节已按可读正文重新生成；其中的结论应结合数据范围与待核验事项阅读。")
         elif self.mode == MODE_NONE or any(item.get("integrity") == "missing" for item in states) or not states:
             integrity = OutputIntegrity.PARTIAL
         else:

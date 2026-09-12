@@ -14,7 +14,7 @@ MODE_TEMPLATE = "template"
 MODE_NONE = "none"
 
 # 计划 §2.2 默认预算：24 次 LLM 请求、24 次结构化取数、8 个工具轮；
-# 搜索/正文提取初版为 0。重试计入对应预算。
+# 搜索初版为 0。重试计入对应预算。
 DEFAULT_BUDGET: dict = {
     "max_llm_requests": 24,
     "max_fetches": 24,

@@ -27,6 +27,8 @@ class ApiConfigService:
         self.models = models
         # Stage 02 adapter registry; main.py binds the market service after build.
         self.market_service = None
+        # V2-03: embedding provider tests run through the knowledge-base service.
+        self.embedding_service = None
         # Serialize read/modify/write so concurrent saves cannot resurrect a cleared key.
         self._write_lock = RLock()
 
@@ -127,19 +129,35 @@ class ApiConfigService:
             raise AppError("not_implemented", "此能力尚未实现，暂无可执行的能力测试；本次未发起外部请求。", 501)
         if not data.confirm_external:
             raise AppError("live_tests_disabled", "请先确认本次测试将发送至该服务且可能计费。", 409)
+        if (spec or {}).get("category") == "embedding":
+            if self.embedding_service is None:
+                raise AppError("not_implemented", "此服务的能力测试尚未实现。", 501)
+            result = await self.embedding_service.test_capability(
+                row["provider"], data.capability, row["credential_version"])
+            saved = self.repository.save_tests(str(profile_id), [result])
+            stored_test = next(item for item in saved["tests"]
+                               if item["capability"] == data.capability)
+            return ApiTestView(**stored_test)
         if (spec or {}).get("category") == "web_search":
             if self.web_service is None:
                 raise AppError("not_implemented", "此服务的能力测试尚未实现。", 501)
             result = await self.web_service.test_capability(
                 row["provider"], data.capability, row["credential_version"])
             saved = self.repository.save_tests(str(profile_id), [result])
-            return ApiTestView(**saved[0])
+            # save_tests returns the persisted profile row (including its tests),
+            # not a list of rows.  Read back the matching stored result so the
+            # response exactly reflects what the UI will display after refresh.
+            stored_test = next(item for item in saved["tests"]
+                               if item["capability"] == data.capability)
+            return ApiTestView(**stored_test)
         if self.market_service is None:
             raise AppError("not_implemented", "此服务的能力测试尚未实现。", 501)
         result = await self.market_service.test_capability(
-            str(profile_id), data.capability, row["credential_version"], provider=row["provider"])
+            str(profile_id), data.capability, row["credential_version"])
         saved = self.repository.save_tests(str(profile_id), [result])
-        return ApiTestView(**saved[0])
+        stored_test = next(item for item in saved["tests"]
+                           if item["capability"] == data.capability)
+        return ApiTestView(**stored_test)
 
     # -- explicit environment import ------------------------------------------
 

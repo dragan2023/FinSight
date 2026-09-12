@@ -32,9 +32,9 @@ export default function EvidenceDrawer({ open, onClose, results }: EvidenceDrawe
       title="数据与证据"
       destroyOnHidden={false}
     >
-      <Space direction="vertical" style={{ width: "100%" }} size="large">
+      <Space orientation="vertical" style={{ width: "100%" }} size="large">
         {results.map((result, index) => (
-          <Space key={index} direction="vertical" style={{ width: "100%" }} size="small">
+          <Space key={index} orientation="vertical" style={{ width: "100%" }} size="small">
             <Space size="small" wrap>
               <Tag color={statusColors[result.status]}>{result.status}</Tag>
               <Typography.Text type="secondary">{result.requested_scope.capability}</Typography.Text>

@@ -10,6 +10,7 @@ import {
 import EvidenceDrawer from "../EvidenceDrawer";
 import SecurityPicker from "../SecurityPicker";
 import ErrorNotice from "../ErrorNotice";
+import LocalDataVisualSummary from "../LocalDataVisualSummary";
 
 const fetchActions: { capability: DataCapability; label: string; hint: string }[] = [
   { capability: "price_snapshot", label: "行情快照", hint: "最新成交与涨跌（60 秒缓存）" },
@@ -45,7 +46,7 @@ export default function DataPreview() {
         ...(capability === "financial_statements" ? { period: "annual" as const, statement: "all" as const } : {}),
       });
       setResults(body.results);
-      setDrawerOpen(true);
+      setDrawerOpen(false);
     } catch (failure) {
       setError(failure);
     } finally {
@@ -58,7 +59,7 @@ export default function DataPreview() {
       title="选标的、取研究资料"
       extra={identity ? <Tag color="blue">{identity.name}</Tag> : <Tag>未确认标的</Tag>}
     >
-      <Space direction="vertical" style={{ width: "100%" }} size="large">
+      <Space orientation="vertical" style={{ width: "100%" }} size="large">
         <SecurityPicker
           value={thscode}
           onChange={(code, confirmed) => {
@@ -85,7 +86,7 @@ export default function DataPreview() {
         </Typography.Text>
         {error ? <ErrorNotice error={error} retry={() => thscode && void run("price_snapshot")} /> : null}
         {results.length > 0 && (
-          <Space size="small" wrap>
+          <><Space size="small" wrap>
             {results.map((result, index) => (
               <Tag key={index} color={result.status === "available" ? "green" : result.status === "partial" ? "orange" : "red"}>
                 {resultStatusLabels[result.status]} · {result.requested_scope.capability}
@@ -94,7 +95,7 @@ export default function DataPreview() {
             <Button type="link" onClick={() => setDrawerOpen(true)}>
               查看数据与证据
             </Button>
-          </Space>
+          </Space><LocalDataVisualSummary results={results} title="本地行情与财务摘要" /></>
         )}
         {results.some((result) => result.status === "unavailable") && (
           <Alert

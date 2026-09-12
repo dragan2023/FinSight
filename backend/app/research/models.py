@@ -37,7 +37,8 @@ class TaskBudget(BaseModel):
     max_llm_requests: int = Field(default=24, ge=0, le=200)
     max_fetches: int = Field(default=24, ge=0, le=200)
     max_tool_rounds: int = Field(default=8, ge=0, le=64)
-    # 搜索/正文提取尚未接入且默认未经授权：固定为 0（计划 §2.2）。
+    # 搜索尚未接入且默认未经授权：固定为 0（计划 §2.2）。正文提取能力已按
+    # 合规红线整体移除（docs/API与数据使用边界.md §4），预算恒为 0。
     max_searches: int = Field(default=0, ge=0, le=0)
     max_extractions: int = Field(default=0, ge=0, le=0)
 

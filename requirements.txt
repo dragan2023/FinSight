@@ -1,5 +1,5 @@
-# Direct backend dependencies validated in this project's .venv on 2026-08-31.
-# requirements.lock.txt records the complete verified development environment.
+# Direct backend runtime dependencies.
+# requirements.lock.txt records the complete runtime environment.
 fastapi==0.136.1
 uvicorn==0.46.0
 pydantic==2.13.3
@@ -10,9 +10,14 @@ langgraph==1.1.10
 cryptography==48.0.0
 # Windows CPython ships no Olson tz database; zoneinfo falls back to this package.
 tzdata==2026.3
-# Stage 04 attachment parsing (plan 04 section 2.5): versions verified in this .venv.
+# Local attachment parsing.
 pypdf==6.16.2
 openpyxl==3.1.5
 defusedxml==0.7.1
 python-multipart==0.0.32
 pywin32==312; sys_platform == "win32"
+# Local columnar store for market-wide research.
+duckdb==1.5.5
+# RSS feed parsing.
+feedparser==6.0.14
+feedparser-sgmllib==2.1.0

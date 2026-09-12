@@ -30,7 +30,8 @@ from decimal import Decimal, InvalidOperation
 
 from pydantic import BaseModel, ConfigDict
 
-from .output_models import Claim, ClaimKind, ResearchReport, SectionStatus
+from .output_models import ChartSpec, Claim, ClaimKind, ResearchReport, SectionStatus
+from .number_grounding import GroundedMetric, extract_quantities, validate_numbers
 
 _TOLERANCE = Decimal("0.005")
 _FLOOR = Decimal("0.0001")
@@ -110,19 +111,7 @@ def _candidates(base: Decimal, suffix: str | None) -> list[Decimal]:
 
 def _quantities(text: str) -> list[list[Decimal]]:
     """Grouped candidate values per number occurrence in the claim text."""
-    stripped = _PERIOD_WITH_WORD.sub(" ", text)
-    stripped = _PERIOD_BARE_YEAR.sub(" ", stripped)
-    stripped = _PERIOD_SHORT.sub(" ", stripped)
-    groups: list[list[Decimal]] = []
-    for match in _QUANTITY.finditer(stripped):
-        base = _decimal_of(match.group(1))
-        if base is None:
-            continue
-        suffix = match.group(2)
-        if suffix is None and base == base.to_integral_value() and Decimal("1900") <= base <= Decimal("2099"):
-            continue  # a bare year that survived stripping is a period, not an amount
-        groups.append(_candidates(base, suffix))
-    return groups
+    return [item.candidates for item in extract_quantities(text)]
 
 
 def _matches_any(candidates: list[Decimal], cited_values: list[tuple[Decimal, str]]) -> bool:
@@ -193,12 +182,13 @@ def _validate_claim(claim: Claim, *, section_id: str, claim_index: int,
         cited = [(metric_values[name][0], metric_values[name][1])
                  for name in metric_refs if name in metric_values and metric_values[name][0] is not None]
         if cited:
-            for candidates in _quantities(claim.text):
-                if not _matches_any(candidates, cited):
-                    issues.append(ValidationIssue(
-                        section_id=section_id, code="metric_conflict",
-                        message="正文数字与被引指标不一致，已标记冲突。", claim_index=claim_index))
-                    break
+            shared_metrics = [GroundedMetric(name=name, value=str(value), unit=unit)
+                              for name, (value, unit) in metric_values.items()
+                              if name in metric_refs and value is not None]
+            if any(item.code == "metric_conflict" for item in validate_numbers(claim.text, shared_metrics)):
+                issues.append(ValidationIssue(
+                    section_id=section_id, code="metric_conflict",
+                    message="正文数字与被引指标不一致，已标记冲突。", claim_index=claim_index))
     return Claim(kind=kind, text=claim.text, evidence_refs=evidence_refs,
                  metric_refs=metric_refs, gap_refs=gap_refs)
 
@@ -227,4 +217,10 @@ def validate_report(report: ResearchReport, context: ValidationContext) -> tuple
             counter.append(item.model_copy(update={"evidence_refs": refs}))
         sections.append(section.model_copy(update={"claims": claims, "status": status,
                                                    "counter_evidence": counter}))
-    return report.model_copy(update={"sections": sections}), issues
+    chart_specs: list[ChartSpec] = []
+    for chart in report.chart_specs:
+        refs = _clean_refs(chart.metric_refs, context.metric_names, "chart_metric_ref_missing",
+                           "图表引用了不存在的指标，已拒绝该图表。", "chart", None, issues)
+        if refs or not chart.metric_refs:
+            chart_specs.append(chart.model_copy(update={"metric_refs": refs}))
+    return report.model_copy(update={"sections": sections, "chart_specs": chart_specs}), issues

@@ -3,13 +3,15 @@ from __future__ import annotations
 from typing import Annotated
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
-from ..dependencies import research_repository
+from ..dependencies import market_service, research_repository
 from ..errors import AppError
 from ..research.theses import ObservationOutcome, ThesisStore
 from ..research.watchlist import WatchlistStore
+from ..research.watchlist_observation import WatchlistObservationService
 
 router=APIRouter(tags=["company-research"])
 Repo=Annotated[object,Depends(research_repository)]
+Market=Annotated[object,Depends(market_service)]
 class WatchlistInput(BaseModel):
     model_config=ConfigDict(extra="forbid"); security_id:str; thscode:str=Field(pattern=r"^[0-9]{6}\.(SH|SZ|BJ)$"); name:str=Field(min_length=1,max_length=100); tags:list[str]=Field(default_factory=list,max_length=12)
 class TagsInput(BaseModel): model_config=ConfigDict(extra="forbid"); tags:list[str]=Field(max_length=12)
@@ -19,6 +21,10 @@ class ThesisUpdateInput(BaseModel):
     model_config=ConfigDict(extra="forbid"); content:str=Field(min_length=1,max_length=2000); revoked:bool=False
 class ObservationInput(BaseModel):
     model_config=ConfigDict(extra="forbid"); report_id:str; evidence_refs:list[str]=Field(default_factory=list); metric_refs:list[str]=Field(default_factory=list); outcome:ObservationOutcome; note:str=Field(default="",max_length=2000)
+class WatchlistObserveInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    item_ids: list[str] | None = Field(default=None, max_length=20)
+    refresh: bool = True
 @router.get("/api/watchlist")
 def list_watchlist(repo:Repo): return {"items":[x.model_dump(mode="json") for x in WatchlistStore(repo).list()]}
 @router.post("/api/watchlist",status_code=201)
@@ -32,6 +38,13 @@ def update_watchlist(item_id:str,data:TagsInput,repo:Repo):
 def delete_watchlist(item_id:str,repo:Repo):
     if not WatchlistStore(repo).remove(item_id): raise AppError("not_found","关注标的不存在。",404)
     return {"deleted":True}
+@router.post("/api/watchlist/observe")
+async def observe_watchlist(data: WatchlistObserveInput, repo: Repo, market: Market):
+    observations = await WatchlistObservationService(repo, market).observe(data.item_ids, refresh=data.refresh)
+    return {"items": [item.model_dump(mode="json") for item in observations]}
+@router.get("/api/watchlist/observations")
+def latest_watchlist_observations(repo: Repo):
+    return {"items": [item.model_dump(mode="json") for item in WatchlistObservationService(repo, None).latest()]}
 @router.get("/api/theses")
 def list_theses(repo:Repo,security_id:str|None=None): return {"items":[x.model_dump(mode="json") for x in ThesisStore(repo).list(security_id)]}
 @router.post("/api/theses",status_code=201)

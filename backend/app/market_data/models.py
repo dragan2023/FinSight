@@ -15,6 +15,8 @@ from ..errors import AppError
 THS_ORIGIN = "https://fuyao.aicubes.cn"
 
 THSCODE_PATTERN = re.compile(r"^[0-9]{6}\.(SH|SZ|BJ)$")
+INDEX_THSCODE_PATTERN = re.compile(r"^[0-9]{6}\.(SH|SZ|TI)$")
+FUND_THSCODE_PATTERN = re.compile(r"^[0-9]{6}\.(OF|SH|SZ)$")
 INDICATOR_REPORT_PATTERN = re.compile(r"^[0-9]{4}-[1-4]$")
 
 MAX_SEARCH_LIMIT = 50
@@ -42,22 +44,26 @@ CODE_SOURCE_UNAVAILABLE = 5003
 
 class Capability(StrEnum):
     TICKER_SEARCH = "ticker_search"
+    TICKER_LIST = "ticker_list"
     PRICE_SNAPSHOT = "price_snapshot"
     PRICE_HISTORY = "price_history"
     VALUATION_SNAPSHOT = "valuation_snapshot"
     FINANCIAL_STATEMENTS = "financial_statements"
     FINANCIAL_INDICATORS = "financial_indicators"
     TRADING_DAYS = "trading_days"
+    CORPORATE_ACTIONS = "corporate_actions"
 
 
 ENDPOINTS: dict[Capability, str] = {
     Capability.TICKER_SEARCH: "/api/meta/tickers/search",
+    Capability.TICKER_LIST: "/api/meta/tickers/list",
     Capability.PRICE_SNAPSHOT: "/api/a-share/prices/snapshot",
     Capability.PRICE_HISTORY: "/api/a-share/prices/historical",
     Capability.VALUATION_SNAPSHOT: "/api/a-share/valuations/snapshot",
     Capability.FINANCIAL_STATEMENTS: "/api/a-share/financials/{statement}",
     Capability.FINANCIAL_INDICATORS: "/api/a-share/financials/indicators",
     Capability.TRADING_DAYS: "/api/a-share/calendar/trading-days",
+    Capability.CORPORATE_ACTIONS: "/api/a-share/corporate-actions/adjustment-factors",
 }
 
 STATEMENTS = {"income": "income-statements", "balance": "balance-sheets", "cashflow": "cash-flow-statements"}

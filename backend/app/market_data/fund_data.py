@@ -5,6 +5,8 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Iterable
 
+from .instrument_types import validate_provider_fund_type
+
 NAV_RANGES = {"week", "month", "tmonth", "hyear", "year", "twoyear", "tyear", "fyear"}
 FUND_TYPES = {"otc", "etf", "lof", "reit", "bond", "money", "other"}
 
@@ -17,15 +19,20 @@ def require_fund_type(metadata: dict) -> str:
     return fund_type
 
 
-def nav_request_params(fund_id: str, *, range_name: str | None = None) -> dict[str, str]:
-    if not fund_id.strip():
+def nav_request_params(thscode: str, *, range_name: str | None = None) -> dict[str, str]:
+    if not thscode.strip():
         raise ValueError("基金标识不能为空。")
     if range_name is not None and range_name not in NAV_RANGES:
         raise ValueError("净值范围仅支持供应商定义的 week/month/tmonth/hyear/year/twoyear/tyear/fyear。")
-    result = {"fund_id": fund_id.strip()}
+    result = {"thscode": thscode.strip()}
     if range_name:
         result["range"] = range_name
     return result
+
+
+def provider_fund_type(metadata: dict) -> str:
+    """Validate the upstream enum separately from FinSight's research class."""
+    return validate_provider_fund_type(str(metadata.get("provider_fund_type") or ""))
 
 
 def discover_report_dates(rows: Iterable[dict]) -> list[dict[str, str]]:

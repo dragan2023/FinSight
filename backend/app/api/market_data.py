@@ -94,7 +94,7 @@ async def fetch(data: FetchInput, service: Service):
         return {"results": [result.model_dump()]}
 
     thscode = _require_thscode(data)
-    service.require_identity(thscode)
+    service.require_stock_identity(thscode)
     security_id = thscode
     if data.capability == "price_snapshot":
         result = await service.fetch_price_snapshot([thscode], security_id=security_id,

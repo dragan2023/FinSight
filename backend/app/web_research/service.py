@@ -1,24 +1,29 @@
-"""Web research service: provider dispatch plus shared local policy.
+"""Web research service: single compliant provider plus shared local policy.
 
+博查是唯一搜索提供方（付费官方 API，用户自带 Key，仅用户主动触发）。
 Policy that must not depend on provider behaviour lives here: the local domain
 filter, deduplication and the visible count cap. Reprint detection has no
 reliable signal, so only identical entries are deduplicated and the original
 publisher field is preserved untouched; near-duplicates across domains are
-kept and left for human/model judgement. Nothing in batch 01 is persisted:
+kept and left for human/model judgement. Nothing is persisted:
 results are reference-only leads.
+
+合规红线（docs/API与数据使用边界.md §4）：本服务只调用博查搜索 API 并使用
+其返回的标题/摘要/链接；不抓取、不下载、不解析任何网页正文，产品内不存在
+自建网页抓取技术。
 """
 
 from __future__ import annotations
 
 import httpx
 
-import socket
-
 from ..api_config.service import ApiConfigService
 from ..errors import AppError
 from .bocha import BochaSearchClient
 from .models import (
     PROVIDERS,
+    SearchPermissionDenied,
+    SearchUnauthenticated,
     SearchItem,
     WebSearchError,
     WebSearchRequest,
@@ -26,12 +31,6 @@ from .models import (
     host_matches,
     utc_now_iso,
 )
-from .public_reader import PublicPageReader
-from .url_safety import (
-    DEFAULT_OFFICIAL_DOMAINS,
-    validate_extract_target,
-)
-from .tavily import TavilySearchClient
 
 
 class WebResearchService:
@@ -39,7 +38,6 @@ class WebResearchService:
         self._credentials = credentials
         self._clients = {
             "bocha": BochaSearchClient(http, credential_source=self.credential_source("bocha")),
-            "tavily": TavilySearchClient(http, credential_source=self.credential_source("tavily")),
         }
 
     # -- credentials ---------------------------------------------------------
@@ -117,45 +115,27 @@ class WebResearchService:
             warnings=warnings,
         )
 
-    # -- public page reads + extraction (batch 02) ----------------------------
-    async def extract_pages(self, urls: list[str]) -> tuple[dict[str, str], list[tuple[str, str]]]:
-        """Tavily Extract; billed per successful page, failures stay per-URL."""
-        for url in urls:
-            validate_extract_target(url)
-        return await self._clients["tavily"].extract(list(urls))
-
-    async def read_public_pages(self, urls: list[str], *, extra_domains=None,
-                                resolver=socket.getaddrinfo):
-        """Allowlisted official-domain reads with pinned DNS and hard caps."""
-        allowed = DEFAULT_OFFICIAL_DOMAINS
-        if extra_domains:
-            from .url_safety import normalize_allowlist
-            allowed = normalize_allowlist(list(DEFAULT_OFFICIAL_DOMAINS) + list(extra_domains))
-        reader = PublicPageReader()
-        return await reader.read_many(urls, allowed_domains=allowed, resolver=resolver)
-
     # -- capability tests (settings page, confirm-gated) ----------------------
     async def test_capability(self, provider: str, capability: str,
                               credential_version: int) -> dict:
         """Minimal real probe for one catalog capability; never fakes results."""
         if provider not in PROVIDERS:
             raise AppError("not_implemented", "此服务的适配器尚未实现，暂无可执行的能力测试；本次未发起外部请求。", 501)
-        expected = {"bocha": "web_search", "tavily": ("search" if capability == "search" else "extract")}
-        if capability != expected.get(provider):
+        if capability != "web_search":
             raise AppError("unknown_capability", "此服务没有所请求的能力项。", 422)
         status, message = "ok", ""
         try:
-            if capability == "extract":
-                succeeded, _failed = await self._clients[provider].extract(
-                    ["https://www.sse.com.cn/"])
-                message = "提取连通性正常。" if succeeded else "连通正常，但本次没有取得正文。"
-            else:
-                request = WebSearchRequest(query="FinSight 连通性测试", count=1, include_summary=False)
-                items, _warnings = await self._clients[provider].search(request)
-                message = "搜索连通性正常，返回 1 条结果。" if items else "连通正常，但本次搜索没有返回结果。"
+            # 先走官方余额接口，避免把 API Key 未认证、账号权限和
+            # Web Search 请求本身的问题混为"权限不足"。余额不会返回给前端。
+            await self._clients["bocha"].balance()
+            request = WebSearchRequest(query="FinSight 连通性测试", count=1, include_summary=False)
+            items, _warnings = await self._clients["bocha"].search(request)
+            message = "账户认证与搜索连通性正常，返回 1 条结果。" if items else "账户认证正常，但本次搜索没有返回结果。"
         except WebSearchError as error:
-            if error.category == "permission_denied":
-                status, message = "permission_denied", "凭据对该能力没有权限，请检查 Key 或套餐。"
+            if isinstance(error, SearchUnauthenticated):
+                status, message = "permission_denied", "博查未接受该 API Key。请在开放平台核对 Key；输入框只需粘贴 Key 本体，不要包含 Bearer 前缀。"
+            elif isinstance(error, SearchPermissionDenied):
+                status, message = "permission_denied", "博查账号暂未获得网页搜索权限，或余额不足。请在开放平台核对服务权限与余额。"
             elif error.category == "quota_limited":
                 status, message = "quota_limited", "已触发频率或额度限制。"
             else:
