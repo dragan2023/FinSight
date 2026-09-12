@@ -8,3 +8,16 @@ frontend/node_modules/
 
 # ==== 本机工具状态目录 ====
 .dsh-project-memory/
+
+# ==== 字节码与前端构建产物（可重新生成，不入库）====
+__pycache__/
+*.pyc
+*.pyo
+frontend/dist/
+
+# ==== 本地行情大数据（约 884 MB，可由 scripts/sync_*.py 重新同步，不入库）====
+data/market/
+
+# ==== 运行时产物 ====
+logs/*.log
+logs/startup.lock
