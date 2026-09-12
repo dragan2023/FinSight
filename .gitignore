@@ -21,3 +21,10 @@ data/market/
 # ==== 运行时产物 ====
 logs/*.log
 logs/startup.lock
+
+# ==== 本机数据库：含加密凭据密文与业务数据，绝不入库 ====
+# 即使只是 Fernet 密文，也按"任何含密钥的文件都不进 git"的红线执行。
+data/db/*.db
+data/*.db
+*.sqlite
+*.sqlite3
