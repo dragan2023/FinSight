@@ -1,15 +1,19 @@
 """Fixed DuckDB schema and queries; no caller-supplied SQL."""
 from __future__ import annotations
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 import duckdb
 from .schema import ADJUSTMENT_FACTOR_COLUMNS, DAILY_COLUMNS, FROZEN_READONLY_DATASETS
 
 #: 事件研究**预计算面板**的版本号。改了下面的 SQL 就要改它——否则旧缓存会被当成新口径用。
+#: v5：新增**可成交口径**列（`next_open` / `forward_return_next_open` /
+#:     `forward_return_next_intraday` / `next_open_gap` / `next_open_ms`）——
+#:     起点由 T 收盘改为 **T+1 开盘**，公司行动只计入**严格晚于 T+1** 的除权除息。
 #: v4：`forward_return` 把**配股比例**加回乘数，与修正后的 `service.total_return` 一致。
 #: v3：补一条有界修正语句，重算"最近 20 根 K 线跨度超过回溯上限"的行（长期停牌复牌股）。
 #: v2：`forward_return` 改为复刻 `service.total_return` 的既有口径（配股只减成本、不进乘数）。
-PANEL_SCHEMA_VERSION = "event_panel_v4"
+PANEL_SCHEMA_VERSION = "event_panel_v5"
 PANEL_FILENAME = "finsight_event_panel.duckdb"
 
 #: 快照列的回溯上限（**自然日**），必须等于 `cross_section(history_days=...)` 的默认值。
@@ -45,7 +49,7 @@ SNAPSHOT_HISTORY_DAYS = 400
 PANEL_BUILD_SQL = """
 CREATE OR REPLACE TABLE event_panel AS
 WITH bars AS (
-    SELECT thscode, date_ms, close_price, turnover,
+    SELECT thscode, date_ms, open_price, close_price, turnover,
            row_number() OVER (PARTITION BY thscode ORDER BY date_ms) AS rn
     FROM market.daily_k WHERE close_price > 0
 ),
@@ -60,7 +64,7 @@ acts AS (
     GROUP BY b.thscode, b.rn, exact
 ),
 grid AS (
-    SELECT b.thscode, b.date_ms, b.close_price, b.turnover, b.rn,
+    SELECT b.thscode, b.date_ms, b.open_price, b.close_price, b.turnover, b.rn,
            coalesce(s.bonus, 0) AS s_bonus, coalesce(s.dividend, 0) AS s_div,
            coalesce(s.rights, 0) AS s_rights, coalesce(s.rights_cost, 0) AS s_cost,
            coalesce(o.bonus, 0) AS o_bonus, coalesce(o.dividend, 0) AS o_div,
@@ -106,12 +110,49 @@ SELECT thscode, date_ms,
                   + (sum(s_rights) OVER w_co + sum(o_rights) OVER w_off))
              + (sum(s_div) OVER w_co + sum(o_div) OVER w_off)
              - (sum(s_cost) OVER w_co + sum(o_cost) OVER w_off))
-            / close_price - 1 ELSE NULL END AS forward_return
+            / close_price - 1 ELSE NULL END AS forward_return,
+       -- ---- v5：**可成交口径**（买入点 = T+1 开盘，见 `20` 号文档 §5 / `21` 号文档）----
+       -- `next_open_ms` 是**买入日**；前向窗口的终点仍是 T+20 收盘（与 forward_return
+       -- 同一终点，两条口径才能直接并排比较）。
+       lead(date_ms, 1) OVER w AS next_open_ms,
+       lead(open_price, 1) OVER w AS next_open,
+       lead(close_price, 1) OVER w AS next_close,
+       -- 公司行动**严格晚于买入日**（`ex_date_ms > T+1`）：买在 T+1 开盘的人拿不到
+       -- T+1 当天除权的分红/送股——那天他买到的就是除权后的价格。分两股取窗口，
+       -- 理由与 v1 的同名逻辑相同（除权日与 K 线日不重合的那批要单独算）：
+       --   精确落盘：第 T+2 … T+20 根 K 线（ROWS 2 FOLLOWING AND 20 FOLLOWING）
+       --   两日之间：落在 (barT+1, barT+2] … (barT+19, barT+20] 的事件
+       --             → 赋给第 T+1 … T+19 根 K 线（ROWS 1 FOLLOWING AND 19 FOLLOWING）
+       -- 起点写成 1 FOLLOWING 而不是 CURRENT ROW 是**这一步最容易写错的地方**：
+       -- CURRENT ROW 会把 T 与 T+1 之间的除权算进来，而那发生在买入之前。
+       -- 注意：本段 SQL 走 str.format()，注释里**不能出现孤立的花括号**（踩过：
+       -- KeyError: 'T+2'）。要写区间请用 barT+1 这种写法。
+       sum(s_bonus) OVER w_co2 + sum(o_bonus) OVER w_off2 AS fwd2_bonus,
+       sum(s_div) OVER w_co2 + sum(o_div) OVER w_off2 AS fwd2_div,
+       sum(s_rights) OVER w_co2 + sum(o_rights) OVER w_off2 AS fwd2_rights,
+       sum(s_cost) OVER w_co2 + sum(o_cost) OVER w_off2 AS fwd2_cost,
+       CASE WHEN lead(close_price, 20) OVER w > 0 AND lead(open_price, 1) OVER w > 0 THEN
+             (lead(close_price, 20) OVER w
+              * (1 + (sum(s_bonus) OVER w_co2 + sum(o_bonus) OVER w_off2)
+                   + (sum(s_rights) OVER w_co2 + sum(o_rights) OVER w_off2))
+              + (sum(s_div) OVER w_co2 + sum(o_div) OVER w_off2)
+              - (sum(s_cost) OVER w_co2 + sum(o_cost) OVER w_off2))
+             / lead(open_price, 1) OVER w - 1 ELSE NULL END AS forward_return_next_open,
+       -- T+1 开盘 → T+1 收盘。窗口是 (T+1, T+1]——**空的**，所以任何公司行动都不该进来
+       -- （T+1 当天除权的股票，买的已经是除权价）。写成裸价格比正是这个道理。
+       CASE WHEN lead(open_price, 1) OVER w > 0 AND lead(close_price, 1) OVER w > 0
+            THEN lead(close_price, 1) OVER w / lead(open_price, 1) OVER w - 1
+            ELSE NULL END AS forward_return_next_intraday,
+       -- 「买不到」的量化：封板到收盘的股票，次日开盘相对今收盘的跳空。
+       CASE WHEN lead(open_price, 1) OVER w > 0
+            THEN lead(open_price, 1) OVER w / close_price - 1 ELSE NULL END AS next_open_gap
 FROM masked
 WINDOW w AS (PARTITION BY thscode ORDER BY rn),
        w20 AS (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 19 PRECEDING AND CURRENT ROW),
        w_co AS (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 1 FOLLOWING AND 20 FOLLOWING),
-       w_off AS (PARTITION BY thscode ORDER BY rn ROWS BETWEEN CURRENT ROW AND 19 FOLLOWING)
+       w_off AS (PARTITION BY thscode ORDER BY rn ROWS BETWEEN CURRENT ROW AND 19 FOLLOWING),
+       w_co2 AS (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 2 FOLLOWING AND 20 FOLLOWING),
+       w_off2 AS (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 1 FOLLOWING AND 19 FOLLOWING)
 """
 
 
@@ -605,8 +646,17 @@ class WarehouseRepository:
                     and meta.get("fingerprint") == _fingerprint_text(fingerprint)):
                 return {"rebuilt": False, "path": str(target), "meta": meta}
         target.parent.mkdir(parents=True, exist_ok=True)
+        #: **构建到临时文件，再原子替换**。理由（实测两次踩到）：
+        #: `CREATE OR REPLACE TABLE` **不回收旧数据块**——同一个文件里每重建一次就多留一份
+        #: 旧表的块，文件随之近乎翻倍（实测 v4 面板 395 MB → 升到 v5 并重建两次后 **1099 MB**）。
+        #: 先 `CHECKPOINT` 只能缓解、不能根治。改成"另写一份 + `os.replace`"之后，
+        #: 文件大小恒等于**一次**构建的大小，且替换是原子的：构建中途失败时旧面板still在，
+        #: 不会留下半成品（面板是派生物，重建永远安全，但半个文件不安全）。
+        building = target.with_name(target.name + ".building")
+        if building.exists():
+            building.unlink()
         escaped = str(self.path).replace("'", "''")
-        db = duckdb.connect(str(target))
+        db = duckdb.connect(str(building))
         try:
             db.execute("PRAGMA enable_progress_bar=false")
             db.execute(f"ATTACH '{escaped}' AS market (READ_ONLY)")
@@ -619,12 +669,16 @@ class WarehouseRepository:
                            [("schema_version", PANEL_SCHEMA_VERSION), ("horizon_days", "20"),
                             ("fingerprint", _fingerprint_text(fingerprint)),
                             ("source_path", str(self.path)), ("built_at", _now_iso())])
-            # `CREATE OR REPLACE` 会把旧表的数据块留在文件里（实测重建后文件翻倍：
-            # 383MB → 767MB）。CHECKPOINT 回收它们，否则每次重建都翻一倍。
             db.execute("CHECKPOINT")
             db.commit()
-        finally:
+        except Exception:
             db.close()
+            if building.exists():
+                building.unlink()
+            raise
+        else:
+            db.close()
+        os.replace(building, target)
         return {"rebuilt": True, "path": str(target),
                 "meta": self.event_panel_meta(panel_path=target), "fingerprint": fingerprint}
 
@@ -691,7 +745,12 @@ class WarehouseRepository:
                     f"SELECT DISTINCT date_ms FROM event_panel {where} ORDER BY date_ms",
                     params).fetchall()]
             columns = ("thscode", "turnover_today", "turnover_20", "close_20_ago",
-                       "close_60_ago", "horizon_ms", "forward_return")
+                       "close_60_ago", "horizon_ms", "forward_return",
+                       # v5 可成交口径列（`20` §5）：不放进 SELECT 就会让
+                       # `--return-basis next_open` 在面板通路上静默拿不到值。
+                       "next_open_ms", "next_open", "next_close",
+                       "forward_return_next_open", "forward_return_next_intraday",
+                       "next_open_gap")
             for start in range(0, len(wanted), chunk_dates):
                 chunk = wanted[start:start + chunk_dates]
                 marks = ",".join("?" for _ in chunk)
@@ -852,6 +911,79 @@ class WarehouseRepository:
             db.close()
         keys = ("thscode", "close_t", "horizon_ms", "horizon_close",
                 "bonus", "dividend", "rights", "rights_cost")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def settlement_returns_next_open(self, *, date_ms: int, horizon_days: int = 20) -> list[dict]:
+        """**可成交口径**的前向收益原料（固定 SQL 模板）——买入点 = **T+1 开盘**。
+
+        与 `settlement_returns` 的两处差别，都是有意的（`20` 号文档 §5）：
+
+        1. **买入价用 T+1 开盘**（`next_open`），不是 T 收盘。封板到收盘的股票当日买不到，
+           用 T 收盘起算隐含"按收盘价成交"，那正是本次要检验掉的假设；
+        2. **公司行动只计入严格晚于买入日的**（`ex_date_ms > date_ms(T+1)`）。买在 T+1 开盘
+           的人拿不到 T+1 当天除权的分红/送股——他买到的已经是除权价。
+
+        同时给出 `next_close` 与 `close_t`，便于算出次日日内收益与"买不到"的跳空幅度
+        （`next_open / close_t − 1`）。终点仍是 **T+horizon 收盘**，与 `settlement_returns`
+        同一终点，两条口径才可直接并排比较。
+
+        ⚠️ 与 `settlement_returns` 同一条纪律：这是**结果侧**数据，绝不可作为信号输入。
+        """
+        if date_ms <= 0 or not 1 <= horizon_days <= 250:
+            raise ValueError("评估日必须为正、预测期需在 1–250 个交易日之间。")
+        if not self.path.exists():
+            return []
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            rows = db.execute("""
+                WITH at_t AS (
+                    SELECT thscode, close_price AS close_t, date_ms AS t_ms,
+                           row_number() OVER (PARTITION BY thscode ORDER BY date_ms DESC) AS rn
+                    FROM daily_k WHERE date_ms <= ? AND close_price > 0
+                ), base_t AS (
+                    SELECT thscode, close_t, t_ms FROM at_t WHERE rn = 1
+                ), forwards AS (
+                    SELECT d.thscode, d.date_ms AS fwd_ms, d.close_price AS fwd_close,
+                           d.open_price AS fwd_open,
+                           row_number() OVER (PARTITION BY d.thscode ORDER BY d.date_ms) AS step
+                    FROM daily_k d JOIN base_t b ON b.thscode = d.thscode
+                    WHERE d.date_ms > b.t_ms AND d.close_price > 0
+                ), steps AS (
+                    SELECT thscode,
+                           max(CASE WHEN step = 1 THEN fwd_ms END) AS next_open_ms,
+                           max(CASE WHEN step = 1 THEN fwd_open END) AS next_open,
+                           max(CASE WHEN step = 1 THEN fwd_close END) AS next_close,
+                           max(CASE WHEN step = ? THEN fwd_ms END) AS horizon_ms,
+                           max(CASE WHEN step = ? THEN fwd_close END) AS horizon_close
+                    FROM forwards GROUP BY thscode
+                ), events AS (
+                    SELECT a.thscode,
+                           sum(coalesce(a.per_share_bonus, 0)) AS bonus,
+                           sum(coalesce(a.dividend_per_share, 0)) AS dividend,
+                           sum(coalesce(a.allotment_ratio, 0)) AS rights,
+                           sum(coalesce(a.allotment_ratio, 0) * coalesce(a.allotment_price, 0))
+                               AS rights_cost
+                    FROM adjustment_factors a
+                    JOIN steps s ON s.thscode = a.thscode
+                    WHERE a.ex_date_ms > s.next_open_ms AND a.ex_date_ms <= s.horizon_ms
+                    GROUP BY a.thscode
+                )
+                SELECT s.thscode, b.close_t, s.next_open_ms, s.next_open, s.next_close,
+                       s.horizon_ms, s.horizon_close,
+                       coalesce(e.bonus, 0), coalesce(e.dividend, 0),
+                       coalesce(e.rights, 0), coalesce(e.rights_cost, 0)
+                FROM steps s JOIN base_t b ON b.thscode = s.thscode
+                LEFT JOIN events e ON e.thscode = s.thscode
+                WHERE s.horizon_close IS NOT NULL AND s.horizon_close > 0
+                  AND s.next_open IS NOT NULL AND s.next_open > 0
+                ORDER BY s.thscode
+            """, [date_ms, horizon_days, horizon_days]).fetchall()
+        except duckdb.CatalogException:
+            return []
+        finally:
+            db.close()
+        keys = ("thscode", "close_t", "next_open_ms", "next_open", "next_close",
+                "horizon_ms", "horizon_close", "bonus", "dividend", "rights", "rights_cost")
         return [dict(zip(keys, row)) for row in rows]
 
     def query(self, *, date_ms: int, metric: str, min_turnover: float = 0, page: int = 1, page_size: int = 100) -> dict:

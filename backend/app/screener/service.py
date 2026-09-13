@@ -47,6 +47,22 @@ def _day(date_ms: int) -> str:
     return datetime.fromtimestamp(date_ms / 1000, CST).strftime("%Y-%m-%d")
 
 
+def total_return_between(entry_price, horizon_close, bonus=0.0, dividend=0.0,
+                         rights=0.0, rights_cost=0.0) -> float | None:
+    """总收益的**唯一公式**：`(close_h × (1+送股+配股) + 分红 − 配股成本) / 买入价 − 1`。
+
+    抽出来是为了让**可成交口径**（买入价 = T+1 开盘）与既有口径（买入价 = T 收盘）
+    共用同一个公式——两处各写一遍迟早会漂移，而"总收益怎么算"是这套评价的地基
+    （与 `19` 号文档修的配股口径是同一类风险）。
+
+    买入价缺失或 ≤ 0 时返回 `None`（不是 0）：拿 0 兜底会把"买不到"伪装成"收益为 0"，
+    正是本次要检验掉的那个假设。
+    """
+    if not entry_price or entry_price <= 0 or horizon_close is None or horizon_close <= 0:
+        return None
+    return ((horizon_close * (1 + bonus + rights) + dividend - rights_cost) / entry_price - 1)
+
+
 def total_return(row: dict) -> float:
     """结算侧窗口总收益：`(close_h × (1+送股+配股) + 分红 − 配股成本) / close_T − 1`。
 

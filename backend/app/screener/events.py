@@ -38,9 +38,10 @@ from __future__ import annotations
 
 import math
 import random
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 
-from .service import _stdev, total_return
+from .service import _stdev, total_return, total_return_between
 
 CST = timezone(timedelta(hours=8))
 
@@ -92,6 +93,164 @@ DERIVED_FIELDS = {
 
 #: 评估侧统一用这张表（池子原生字段 + 派生字段）。
 ALL_FIELDS = {**FIELD_ENCODINGS, **DERIVED_FIELDS}
+
+#: 字段所属的**统计族**。族级多重检验计数**按族**累加（方案 A.2）——
+#: `seal_money` 与 `seal_ratio` 是同一底层数据的两种口径（高度相关，`17` §5 已写明
+#: "不构成独立复现"），因此看过其中一个就等于看过这一族；`continue_day_cnt` 是另一族。
+#:
+#: 这张表存在的理由：族是**报告的必填披露项**。没有它，族级计数就只能靠调用方
+#: 心里记着"哪些字段算一族"，而那正是 `17` §4.3 暴露的问题（`--family-prior-statistics`
+#: 是全局参数，`--field all` 一跑就把封成比的门槛算松了：显示 3.023 而应为 3.227）。
+FIELD_FAMILIES = {
+    "continue_day_cnt": "limit_up_continue_board",
+    "seal_money": "limit_up_seal_strength",
+    "seal_ratio": "limit_up_seal_strength",
+}
+
+
+def parse_family_prior_statistics(text: str) -> int | dict[str, int]:
+    """解析族级先验计数的**规范文本格式**：`"20"` 或 `"字段=条数,字段=条数"`。
+
+    - 裸整数：所有字段共用（向后兼容；多字段同跑时调用方自负其责，报告里会写明）；
+    - `字段=N` 列表：**按字段**给，这是修 `17` §4.3 那个口径问题后的推荐用法。
+
+    格式错误一律抛错，绝不静默取 0——静默取 0 会让门槛变松，正是 A.2 要防的事。
+    """
+    text = (text or "").strip()
+    if not text:
+        return 0
+    if "=" not in text:
+        return int(text)
+    mapping: dict[str, int] = {}
+    for chunk in text.split(","):
+        field, separator, value = chunk.partition("=")
+        field = field.strip()
+        if not separator or not field or not value.strip():
+            raise ValueError(f"族级先验计数格式错误：{chunk!r}（应为『字段=条数』）")
+        if field not in ALL_FIELDS:
+            raise ValueError(f"族级先验计数出现未知字段：{field!r}（可选 {sorted(ALL_FIELDS)}）")
+        mapping[field] = int(value)
+    if not mapping:
+        raise ValueError(f"族级先验计数为空：{text!r}")
+    return mapping
+
+
+def resolve_family_priors(family_prior_statistics: int | Mapping[str, int],
+                          fields: tuple[str, ...]) -> dict[str, int]:
+    """把「族级先验计数」解析成**逐字段**的条数，并在不合理时**报错而不是静默兜底**。
+
+    语义（`family_prior_statistics` 的准确含义）：**该字段所属族在本轮该字段之外、已看过的
+    全部比较条数**。它包含此前各轮同族的比较，也包含**本轮同族其它字段**的比较——因为
+    "同一族的另一个口径也算看过"（`17` §5）。每条比较 = 一个统计量（变体 × 高/低/高−低、
+    以及分时段复现），与 `_report()` 里 `statistics_tested` 同一口径。
+
+    两条硬性检查（都是为了"门槛只能算严、不能算松"）：
+
+    1. 给出映射时，**每个要评价的字段都必须列在映射里**——缺项不得当成 0；
+    2. **同族字段的先验必须一致**——否则同族两行结果的门槛会不一样，读者无法解释。
+    """
+    if isinstance(family_prior_statistics, Mapping):
+        mapping = family_prior_statistics
+        unknown = sorted(set(mapping) - set(ALL_FIELDS))
+        if unknown:
+            raise ValueError(f"族级先验计数出现未知字段：{unknown}（可选 {sorted(ALL_FIELDS)}）")
+        missing = sorted(set(fields) - set(mapping))
+        if missing:
+            raise ValueError(
+                f"族级先验计数缺少本次要评价的字段：{missing}。按字段给时必须**逐个列全**——"
+                "缺项静默当 0 会把门槛算松（`17` §4.3 就是这么错的）。")
+        if any(int(value) < 0 for value in mapping.values()):
+            raise ValueError("族级先验计数不得为负。")
+    else:
+        if int(family_prior_statistics) < 0:
+            raise ValueError("族级先验计数不得为负。")
+        return {field: int(family_prior_statistics) for field in fields}
+
+    resolved = {field: int(mapping[field]) for field in fields}
+    by_family: dict[str, set[int]] = {}
+    for field, prior in resolved.items():
+        by_family.setdefault(FIELD_FAMILIES[field], set()).add(prior)
+    inconsistent = {family: sorted(priors) for family, priors in by_family.items()
+                    if len(priors) > 1}
+    if inconsistent:
+        raise ValueError(
+            f"同族字段的族级先验不一致：{inconsistent}。同族字段是**一起被看过的**，"
+            "先验必须一致，否则同一个族的不同口径会有不同门槛。")
+    return resolved
+
+
+def _next_open_total_return(row: dict) -> float | None:
+    """可成交口径：买入价 = **T+1 开盘**，终点 = T+20 收盘，公司行动只算晚于买入日的。"""
+    return total_return_between(row.get("next_open"), row.get("horizon_close"),
+                                row.get("bonus", 0.0), row.get("dividend", 0.0),
+                                row.get("rights", 0.0), row.get("rights_cost", 0.0))
+
+
+def _next_intraday_return(row: dict) -> float | None:
+    """T+1 开盘 → T+1 收盘。窗口 (T+1, T+1] 内不可能有除权事件，故写成裸价格比。"""
+    entry, exit_price = row.get("next_open"), row.get("next_close")
+    if not entry or entry <= 0 or not exit_price or exit_price <= 0:
+        return None
+    return exit_price / entry - 1
+
+
+#: **结果口径（端点）登记表**。换口径＝**新定义 → 必须新开 design reference**（A.1）。
+#:
+#: 三条口径共用同一套样本域、对照、分层、匹配与置换机制，**只差"从哪个价格算到哪个价格"**，
+#: 因此结果可以直接并排比较——这正是回答"扣掉买不到之后还剩多少"所需要的形式。
+#:
+#: `panel_column` 是面板里的列名；`settlement_rows` 指明 live 通路读哪张结果表
+#: （`close_t` → `settlement_returns`；`next_open` → `settlement_returns_next_open`）；
+#: `builder` 把 live 的原始行换算成收益率。
+OUTCOME_BASES = {
+    "close_t": {
+        "name": "T 收盘 → T+20 收盘",
+        "panel_column": "forward_return",
+        "settlement_rows": "close_t",
+        "builder": total_return,
+        "buy_point": "评估日 T 的**收盘价**",
+        "corporate_action_cutoff": "ex_date_ms > T（窗口 (T, T+20]）",
+        "tradable": False,
+        "note": "既有口径，`16`/`17` 的全部结论都建立在它上面。**封板到收盘的股票当日收盘价"
+                "买不到**，所以它隐含『按 T 收盘价成交』这个不可实现的假设（D43/D46）。"
+                "本次保留它**只作对照**。",
+    },
+    "next_open": {
+        "name": "T+1 开盘 → T+20 收盘（**可成交口径，本次主检验**）",
+        "panel_column": "forward_return_next_open",
+        "settlement_rows": "next_open",
+        "builder": _next_open_total_return,
+        "buy_point": "评估日**次日（T+1）的开盘价**",
+        "corporate_action_cutoff": "ex_date_ms > T+1（窗口 (T+1, T+20]）——买入日当天除权的"
+                                   "拿不到，因为他买到的已是除权价",
+        "tradable": True,
+        "note": "把买入点挪到次日开盘后，『封板到收盘买不到』这个缺口就被扣掉了。"
+                "它仍然是**超额**（相对同层对照），不是可实现收益：不计冲击成本、"
+                "不计滑点，也未验证 T+1 开盘一定有量。",
+    },
+    "next_intraday": {
+        "name": "T+1 开盘 → T+1 收盘（次日日内）",
+        "panel_column": "forward_return_next_intraday",
+        "settlement_rows": "next_open",
+        "builder": _next_intraday_return,
+        "buy_point": "T+1 开盘价",
+        "corporate_action_cutoff": "窗口 (T+1, T+1] 为空——任何公司行动都不会落在里面",
+        "tradable": True,
+        "note": "**用来判断缺口是不是就是全部效应**：若 20 日效应在次日日内就基本实现，"
+                "那它更像是『次日开盘的溢价/折价』而不是 20 日的持续漂移。",
+    },
+}
+
+#: 各结果口径对应的**预注册设计 reference**——换口径就是换定义，必须新开 reference（A.1）。
+#: 报告里必须写出来，否则读者无法核实"这个门槛是在看到数字之前定的"。
+#:
+#: 注：`20` 号接力件建议把可成交性轮次登记为 `@v6`，实际登记为 **`@v5`**——因为
+#: `@v5` 从未被占用（`@v1`–`@v4` 已用），跳号会让治理台账看起来像缺了一条记录。
+OUTCOME_BASIS_DESIGNS = {
+    "close_t": "limit_up_event_study_design@v1 / @v2 / @v3 / @v4",
+    "next_open": "limit_up_event_study_design@v5",
+    "next_intraday": "limit_up_event_study_design@v5",
+}
 #: 日期错位的最短/最大位移（交易日索引）；该安慰剂已判定无效，仅保留为诊断。
 MIN_SHIFT = 25
 MAX_SHIFT = 250
@@ -108,6 +267,13 @@ def _clean(values) -> list[float]:
 def _mean(values) -> float:
     clean = _clean(values)
     return sum(clean) / len(clean) if clean else float("nan")
+
+
+def _difference(left: float, right: float) -> float:
+    """两个可能为 NaN 的均值之差：任一侧算不出来就返回 NaN，**不拿 0 兜底**。"""
+    if left != left or right != right:
+        return float("nan")
+    return left - right
 
 
 def _t_stat(series) -> float | None:
@@ -241,7 +407,7 @@ class LimitUpEventStudy:
     # --- 单日 -------------------------------------------------------------
     def _study_date(self, date_ms: int, pool: dict[str, dict], *, horizon_days: int,
                     fields: tuple[str, ...], draws: int, rng: random.Random,
-                    pool_union: set[str]) -> dict[str, dict]:
+                    pool_union: set[str], return_basis: str = "close_t") -> dict[str, dict]:
         """一个评估日：逐字段 × 逐变体算真实超额 + 当日的 `draws` 次对照置换。
 
         取数（横截面 + 前向收益）**只做一次**，所有字段与所有变体共用——这是把
@@ -249,12 +415,29 @@ class LimitUpEventStudy:
         而分层与匹配变体的边际成本只是记账与重抽。原始收益当天用完就丢。
         """
         cross = self._repository.cross_section(date_ms=date_ms)
-        outcome = {row["thscode"]: total_return(row)
-                   for row in self._repository.settlement_returns(
-                       date_ms=date_ms, horizon_days=horizon_days)}
+        next_rows = self._repository.settlement_returns_next_open(
+            date_ms=date_ms, horizon_days=horizon_days)
+        gap_by_symbol = {}
+        for row in next_rows:
+            entry_price, close_t = row.get("next_open"), row.get("close_t")
+            gap_by_symbol[row["thscode"]] = (entry_price / close_t - 1
+                                             if entry_price and close_t and close_t > 0 else None)
+        if return_basis == "close_t":
+            outcome = {row["thscode"]: total_return(row)
+                       for row in self._repository.settlement_returns(
+                           date_ms=date_ms, horizon_days=horizon_days)}
+        else:
+            builder = OUTCOME_BASES[return_basis]["builder"]
+            outcome = {}
+            for row in next_rows:
+                value = builder(row)
+                if value is not None:
+                    outcome[row["thscode"]] = value
         if not cross or not outcome:
             return {}
-        snapshot = {row["thscode"]: row for row in cross}
+        snapshot = {row["thscode"]: {**row,
+                                     "next_open_gap": gap_by_symbol.get(row["thscode"])}
+                    for row in cross}
         return self._details(date_ms, pool, snapshot, outcome, horizon_days=horizon_days,
                              fields=fields, draws=draws, rng=rng, pool_union=pool_union)
 
@@ -321,6 +504,9 @@ class LimitUpEventStudy:
                     means = fine_mean if matched else coarse_mean
                     grids = fine if matched else coarse
                     events: dict[str, list[tuple]] = {"high": [], "low": []}
+                    # 「买不到」的量化：次日开盘跳空。**描述量**——不参与分组、不参与重抽、
+                    # 不入门槛，只在同一批事件上顺手记下它的分布（见 `_variant_report`）。
+                    gaps: dict[str, list[float]] = {"high": [], "low": []}
                     for symbol, item in pool.items():
                         if symbol not in outcome or symbol not in buckets:
                             continue
@@ -333,9 +519,13 @@ class LimitUpEventStudy:
                                else buckets[symbol])
                         if key not in means or means[key] != means[key]:
                             continue    # 该格没有对照 → 这个事件不参与，绝不拿别的格子凑
-                        events["high" if flag else "low"].append((key, outcome[symbol]))
+                        side = "high" if flag else "low"
+                        events[side].append((key, outcome[symbol]))
+                        gap = snapshot[symbol].get("next_open_gap")
+                        if isinstance(gap, (int, float)) and gap == gap:
+                            gaps[side].append(gap)
                     variants[variant] = {"events": events, "means": means, "grid": grids,
-                                         "matched": matched}
+                                         "matched": matched, "gaps": gaps}
 
             detail: dict = {"date_ms": date_ms, "median": median, "variants": {}}
             for variant, payload in variants.items():
@@ -357,6 +547,14 @@ class LimitUpEventStudy:
                         permuted[side].append(_mean(sampled))
                 entry["permuted"] = permuted
                 entry["events_used"] = entry["high_events"] + entry["low_events"]
+                entry["next_open_gap"] = {
+                    "high_mean": _mean(payload["gaps"]["high"]),
+                    "low_mean": _mean(payload["gaps"]["low"]),
+                    "high_minus_low": _difference(_mean(payload["gaps"]["high"]),
+                                                  _mean(payload["gaps"]["low"])),
+                    "high_events": len(payload["gaps"]["high"]),
+                    "low_events": len(payload["gaps"]["low"]),
+                }
                 detail["variants"][variant] = entry
             # 向后兼容：顶层字段 = base_all 变体（旧调用方与测试直接读 results/permuted）
             detail.update(detail["variants"]["base_all"])
@@ -444,6 +642,20 @@ class LimitUpEventStudy:
                                      "mean_excess": round(_mean(diff), 6),
                                      "t_stat": _t_stat(diff),
                                      "days_positive": sum(1 for value in _clean(diff) if value > 0)}
+        # 「买不到」的量化：高/低两组**次日开盘跳空**的均值与差值。
+        # ⚠️ 它是**描述量**，所以**不放进 `results`**（那里只有被检验的三个统计量），
+        # 而是单独一块 `descriptive`：不给 t 值、不入门槛计数。给它一个 t 就会把它拖进
+        # 多重检验计数、并诱使读者拿它当第 N 个显著性声明（要当检验端点须新开 reference）。
+        gap = [entry["next_open_gap"] for entry in entries]
+        descriptive = {"next_open_gap": {
+            "group": "次日开盘跳空（描述量，**不入门槛**）", "events": None,
+            "mean_excess": round(_mean([item["high_minus_low"] for item in gap]), 6),
+            "high_mean": round(_mean([item["high_mean"] for item in gap]), 6),
+            "low_mean": round(_mean([item["low_mean"] for item in gap]), 6),
+            "events_high": sum(item["high_events"] for item in gap),
+            "events_low": sum(item["low_events"] for item in gap),
+            "t_stat": None,
+        }}
         # 合并逐日置换：**同一抽签序号跨日**组合成一条可能的历史，再算 t 分布。
         # 高组−低组也要有自己的零分布——不然"没有区分度"这句话就没有对照。
         by_group = {}
@@ -469,13 +681,15 @@ class LimitUpEventStudy:
             "stratum": stratum,
             "events": sum(entry["events_used"] for entry in entries),
             "results": results,
+            "descriptive": descriptive,
             "placebo": {"kind": "对照置换（同层重抽，保样本量与日期分布）",
                         "by_group": by_group},
         }
 
     def _report(self, field: str, per_date: dict[int, dict], *, horizon_days: int,
                 draws: int, seed: int, dates_with_pool: int,
-                family_prior_statistics: int = 0, source_info: dict | None = None) -> dict:
+                family_prior_statistics: int = 0, source_info: dict | None = None,
+                return_basis: str = "close_t") -> dict:
         usable = sorted(per_date)
         names = sorted(per_date[usable[0]]["variants"]) if usable else []
         variants = {name: self._variant_report(field, per_date, usable, name, draws)
@@ -508,12 +722,20 @@ class LimitUpEventStudy:
             # 数据通路必须随结果一起披露：面板与 live 已做过逐位等价比对（49,095 个单元
             # 零差异），但读者仍需知道这份数字是从哪条通路来的。
             "data_path": source_info or {"source": "live"},
+            # **结果口径**必须与数字一起披露：同一个 t 值在"T 收盘起算"与"T+1 开盘起算"
+            # 下含义完全不同（前者不可成交）。换口径＝新定义，须新开 design reference。
+            "outcome_basis": {
+                "id": return_basis,
+                **{key: value for key, value in OUTCOME_BASES[return_basis].items()
+                   if key not in ("panel_column", "settlement_rows", "builder")},
+            },
             "horizon_days": horizon_days, "draws": draws,
             "dates_with_pool": dates_with_pool, "dates_usable": len(usable),
             "events_total": base.get("events", 0),
             "control_size_median": (sorted(per_date[d]["control_size"] for d in usable)[
                 len(usable) // 2] if usable else None),
             "results": base.get("results", {}),
+            "descriptive": base.get("descriptive", {}),
             "variants": variants,
             "by_period": replication,
             "multiplicity": {
@@ -525,12 +747,18 @@ class LimitUpEventStudy:
                 "per_test_abs_t": 1.96,
                 "bonferroni_primary_abs_t": primary_threshold,
                 "bonferroni_all_abs_t": all_threshold,
+                "family": FIELD_FAMILIES[field],
                 "family_prior_statistics": max(0, int(family_prior_statistics)),
                 "family_total_statistics": family_total,
                 "bonferroni_family_abs_t": family_threshold,
+                "family_counting_note": "族级计数**按字段**给（`17` §4.3 修正）："
+                                        "`family_prior_statistics` = 该字段所属族在本轮该字段"
+                                        "之外已看过的全部比较条数（含此前轮次与本轮同族其它字段），"
+                                        "本轮该字段的 "
+                                        f"{statistics_tested} 条另加 → 族级共 {family_total} 条。",
                 "note": "按方案 A.2，多重检验计数必须包含**全部尝试过的**比较（含本轮新增的"
                         "稳健性变体、分时段复现，以及**同一族此前已做过的**比较——"
-                        "`family_prior_statistics` 就是上一轮已看过的条数）；主检验只有 2 条，"
+                        "`family_prior_statistics` 就是那部分的条数）；主检验只有 2 条，"
                         "其余是稳健性检验。三套门槛都给出来，读者可自行判断哪些结论同时过严格门槛。",
             },
             "placebo": {
@@ -544,7 +772,7 @@ class LimitUpEventStudy:
                             f"（主检验 |t|≥{primary_threshold}，本次全部比较 |t|≥{all_threshold}，"
                             f"含同族此前比较的 |t|≥{family_threshold}）。"
                             "安慰剂只作机制自检，**不得**当作显著性门槛。",
-            "design": "hypothesis_registry: limit_up_event_study_design@v1 / @v2",
+            "design": "hypothesis_registry: " + OUTCOME_BASIS_DESIGNS[return_basis],
             "limitations": [
                 "涨停池只覆盖已同步的交易日（实测可回溯到 2022-01-05，更早的日子静默返回 0 条），"
                 "样本是 2022 年以后的市场状态，不可外推。",
@@ -553,8 +781,15 @@ class LimitUpEventStudy:
                 "本地行情库不含退市标的（幸存者偏差），『涨停后一路走坏直至退市』的情形"
                 "不可能出现在样本里，因此负向超额被**低估**、正向超额被高估。",
                 "这是**超额**（相对同层对照），不是可实现收益：不计交易成本、不考虑次日"
-                "难以成交，也不构成任何可执行的多空策略。封板标的**当日收盘价买不到**，"
-                "而窗口隐含『按 close_T 成交』。",
+                "难以成交，也不构成任何可执行的多空策略。"
+                + ("**本口径起算于 T 收盘价——封板到收盘的标的当日买不到**，"
+                   "因此它隐含『按 close_T 成交』这个不可实现的假设（D43/D46）；"
+                   "可成交口径见 `next_open`。"
+                   if not OUTCOME_BASES[return_basis]["tradable"] else
+                   f"**本口径起算于{OUTCOME_BASES[return_basis]['buy_point']}**"
+                   f"（买入日后才计入公司行动：{OUTCOME_BASES[return_basis]['corporate_action_cutoff']}），"
+                   "『封板当日买不到』的缺口已被扣掉；但仍未计冲击成本与滑点，"
+                   "也未验证 T+1 开盘一定有足够成交量。"),
                 "逐日超额存在重叠样本（连板连续上榜）与市场状态持续，t 值假设逐日独立，"
                 "因此 |t| 偏乐观；分时段复验与多重检验门槛是为此设的防线。",
                 "前向收益含评估日之后的信息，**只用于事后评价**，不得作为信号输入。",
@@ -575,12 +810,17 @@ class LimitUpEventStudy:
 
     def _date_pairs(self, dates: list[int], by_date: dict[int, dict],
                     *, start_ms: int | None, end_ms: int | None, source: str,
-                    horizon_days: int):
+                    horizon_days: int, return_basis: str = "close_t"):
         """产出 `(date_ms, snapshot, outcome)`。
 
         - `panel`：一次性读出面板里**这些池内日期**的全部输入（不读无关日期）；
         - `live`：逐日查库（慢，但用来证明面板等价）。
+
+        `outcome` 是**该结果口径**下的前向收益。`snapshot` 除了横截面原料，
+        还带上 `next_open_gap`（**次日开盘跳空**）——两条通路都必须给，否则
+        「买不到」的量化会在面板/live 之间不一致，等价比对就失去意义。
         """
+        columns = OUTCOME_BASES[return_basis]["panel_column"]
         if source == "panel":
             wanted = [date_ms for date_ms in dates
                       if (start_ms is None or date_ms >= start_ms)
@@ -589,25 +829,53 @@ class LimitUpEventStudy:
                     dates=wanted, panel_ready_checked=True):
                 if not panel_rows:
                     continue
-                outcome = {symbol: row["forward_return"]
+                outcome = {symbol: row[columns]
                            for symbol, row in panel_rows.items()
-                           if row["forward_return"] is not None}
+                           if row[columns] is not None}
                 yield date_ms, panel_rows, outcome
             return
+        builder = OUTCOME_BASES[return_basis]["builder"]
         for date_ms in dates:
             snapshot = {row["thscode"]: row
                         for row in self._repository.cross_section(date_ms=date_ms)}
-            outcome = {row["thscode"]: total_return(row)
-                       for row in self._repository.settlement_returns(
-                           date_ms=date_ms, horizon_days=horizon_days)}
+            # 次日开盘口径的原始行：既要它算收益（非 close_t 口径），也要它算跳空
+            # （所有口径都要——跳空是「买不到」的量化，描述量也得两条通路一致）。
+            next_rows = self._repository.settlement_returns_next_open(
+                date_ms=date_ms, horizon_days=horizon_days)
+            gap_by_symbol = {}
+            for row in next_rows:
+                entry_price, close_t = row.get("next_open"), row.get("close_t")
+                gap = (entry_price / close_t - 1
+                       if entry_price and close_t and close_t > 0 else None)
+                gap_by_symbol[row["thscode"]] = gap
+            for symbol, row in snapshot.items():
+                row["next_open_gap"] = gap_by_symbol.get(symbol)
+            if return_basis == "close_t":
+                outcome = {row["thscode"]: total_return(row)
+                           for row in self._repository.settlement_returns(
+                               date_ms=date_ms, horizon_days=horizon_days)}
+            else:
+                outcome = {}
+                for row in next_rows:
+                    value = builder(row)
+                    if value is not None:
+                        outcome[row["thscode"]] = value
             yield date_ms, snapshot, outcome
 
     # --- 主入口 -----------------------------------------------------------
     def run_fields(self, *, fields: tuple[str, ...], start_ms: int | None = None,
                    end_ms: int | None = None, horizon_days: int = 20, draws: int = 200,
                    seed: int = 20260913, progress=None,
-                   family_prior_statistics: int = 0, source: str = "panel") -> dict[str, dict]:
+                   family_prior_statistics: int | Mapping[str, int] = 0,
+                   source: str = "panel", return_basis: str = "close_t") -> dict[str, dict]:
         """**一次遍历**算出多个字段的全部变体：取数只做一遍，字段与变体各自分组与重抽。
+
+        `family_prior_statistics`：族级多重检验计数的**先验部分**，可以是整数（所有字段共用）
+        或 `{字段: 条数}`（按字段给，见 `resolve_family_priors` 的语义与两条硬性检查）。
+
+        `return_basis`：结果口径（端点）。`close_t` = 既有口径（T 收盘起算，**不可成交**）；
+        `next_open` = 可成交口径（T+1 开盘起算，本次主检验）；`next_intraday` = T+1 日内。
+        换口径＝换定义，必须新开 design reference（A.1），见 `OUTCOME_BASES`。
 
         `source`：
         - `"panel"`（默认）：用**预计算面板**（一次全表扫描物化全部评估日的输入）。
@@ -624,6 +892,9 @@ class LimitUpEventStudy:
             raise ValueError("重抽次数必须为正、前瞻期需在 1–250 个交易日之间。")
         if source not in ("panel", "live"):
             raise ValueError(f"source 只能是 panel 或 live，收到 {source!r}")
+        if return_basis not in OUTCOME_BASES:
+            raise ValueError(f"return_basis 只能是 {sorted(OUTCOME_BASES)}，收到 {return_basis!r}")
+        family_priors = resolve_family_priors(family_prior_statistics, fields)
 
         rows = self._repository.limit_pool_rows(pool="limit_up", start_ms=start_ms,
                                                 end_ms=end_ms)
@@ -651,7 +922,8 @@ class LimitUpEventStudy:
 
         per_field: dict[str, dict[int, dict]] = {field: {} for field in fields}
         pairs = self._date_pairs(dates, by_date, start_ms=start_ms, end_ms=end_ms,
-                                 source=source, horizon_days=horizon_days)
+                                 source=source, horizon_days=horizon_days,
+                                 return_basis=return_basis)
         for index, (date_ms, snapshot, outcome) in enumerate(pairs, 1):
             details = self._details(date_ms, by_date[date_ms], snapshot, outcome,
                                     horizon_days=horizon_days, fields=fields, draws=draws,
@@ -672,15 +944,16 @@ class LimitUpEventStudy:
                 continue
             reports[field] = self._report(field, per_field[field], horizon_days=horizon_days,
                                           draws=draws, seed=seed, dates_with_pool=len(dates),
-                                          family_prior_statistics=family_prior_statistics,
-                                          source_info=panel_info)
+                                          family_prior_statistics=family_priors[field],
+                                          source_info=panel_info, return_basis=return_basis)
         return reports
 
     def run(self, *, start_ms: int | None = None, end_ms: int | None = None,
             horizon_days: int = 20, field: str = "continue_day_cnt",
             draws: int = 200, seed: int = 20260913, progress=None,
-            source: str = "panel") -> dict:
+            source: str = "panel", return_basis: str = "close_t") -> dict:
         """单字段入口（返回结构保持 `results` = base_all，向后兼容）。"""
         return self.run_fields(fields=(field,), start_ms=start_ms, end_ms=end_ms,
                                horizon_days=horizon_days, draws=draws, seed=seed,
-                               progress=progress, source=source)[field]
+                               progress=progress, source=source,
+                               return_basis=return_basis)[field]

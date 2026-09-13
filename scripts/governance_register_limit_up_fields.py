@@ -177,6 +177,71 @@ DESIGN_V4 = {
     "forbidden": "看到结果后增删变体、改分母、改分层阈值；要改必须新开 reference。",
     "status": "已预注册，**结果尚未产生**",
 }
+#: v5：**可成交性检验**（D48 / `20` 号文档 §5）。把结果窗口的起点从「评估日 T 收盘」
+#: 改成「**T+1 开盘**」，回答 `16`/`17` 悬着的那个问题：最强的那批正是**封板到收盘**的股票，
+#: **当日收盘价根本买不到**——扣掉这个缺口之后，效应还剩多少？
+DESIGN_V5_REFERENCE = "limit_up_event_study_design@v5"
+DESIGN_V5 = {
+    "supersedes_note": "@v1–@v4 的结果口径都是『T 收盘起算』；@v5 **只改结果端点**，"
+                       "字段定义、样本域、对照、分层、匹配与安慰剂全部不变"
+                       "（所以能与既有结果并排比较）。",
+    "question": "把买入点从『评估日收盘』挪到『次日开盘』、并只计入严格晚于买入日的公司行动"
+                "之后，`seal_ratio` / `seal_money` / `continue_day_cnt` 的高低组差异还剩多少？",
+    "outcome_bases_declared": {
+        "close_t": "T 收盘 → T+20 收盘（既有口径，**不可成交**，本轮作对照）",
+        "next_open": "T+1 开盘 → T+20 收盘（**本轮主检验端点**，可成交口径）",
+        "next_intraday": "T+1 开盘 → T+1 收盘（用来判断缺口是不是就是全部效应）",
+    },
+    "primary_endpoints": [
+        "seal_ratio@base_all 的『高−低』（next_open 口径）",
+        "seal_money@base_all 的『高−低』（next_open 口径）",
+        "continue_day_cnt@base_all 的『高−低』（next_open 口径）",
+    ],
+    "corporate_action_cutoff_rule": "**严格晚于买入日**：买在 T+1 开盘的人只计入 "
+                                    "`ex_date_ms > 买入日` 的除权除息——买入日当天除权的拿不到，"
+                                    "因为他买到的已经是除权价。『严格晚于』而不是『不早于』"
+                                    "是**显式选定**的口径，事后不得在两种口径间切换。",
+    "replication": "与 @v3/@v4 相同：2022–2024 与 2025-01-01 起两段。",
+    "auxiliary_descriptive": "`next_open_gap`（T+1 开盘 ÷ T 收盘 − 1）作为**描述量**报告："
+                             "它就是『当日买不到』的量化。**不给 t 值、不入门槛计数**——"
+                             "给它一个 t 会把它拖进多重检验计数，并诱使读者当成第 N 个显著性"
+                             "声明。若将来要把它当检验端点，必须另开 reference 并按"
+                             "『变体 × 统计量』计入计数。",
+    "multiplicity": {
+        "count_definition": "每条比较 = 一个统计量（变体 × 高/低/高−低、以及分时段复现），"
+                            "与 `_report().multiplicity.statistics_tested` 同口径；"
+                            "本轮每字段 = 4 变体 × 3 + 8 个分时段复现 = **20**。",
+        "family_counting_fix": "`17` §4.3 那个口径问题在本轮**已修**：族级先验**按字段**给"
+                               "（`--family-prior-statistics 字段=条数,...`），"
+                               "不再拿一个全局值套到所有字段上。",
+        "history_included": {
+            "v1 首跑": "每字段 3 条（1 个变体 × 高/低/高−低）。`@v3` 起只按『变体 × 3 + 复现』"
+                       "计数，把 v1 这 3 条漏掉了；本轮**补计**（方向是更严，不是更松）。",
+            "v3 稳健性轮": "每字段 20 条（4 变体 × 3 + 8 复现）。",
+            "v4 封成比轮": "seal_ratio 20 条（同族：与 seal_money 共用同一底层数据）。",
+        },
+        "per_field_family_priors": {
+            "continue_day_cnt": "3 (v1) + 20 (v3) = **23**（连板族无同族兄弟）",
+            "seal_money": "3 (v1) + 20 (v3) + 20 (v4) + 20 (本轮 seal_ratio) = **63**",
+            "seal_ratio": "3 (v1) + 20 (v3) + 20 (v4) + 20 (本轮 seal_money) = **63**",
+        },
+        "resulting_thresholds": {
+            "continue_day_cnt": "族级共 43 条 → |t| ≥ **3.248**",
+            "seal_money": "族级共 83 条 → |t| ≥ **3.431**",
+            "seal_ratio": "族级共 83 条 → |t| ≥ **3.431**",
+            "compare": "`17`/`19` 用的是 3.227（族级 40 条）。本轮**更严**——"
+                       "因为补计了 v1 的 3 条、并把本轮同族兄弟的 20 条算了进来。"
+                       "既有结论只会因此更稳，不是被放宽。",
+        },
+    },
+    "reporting_requirement": "三口径**必须并排**给出（同一样本域），并**如实回答『还剩多少』**；"
+                             "若效应在可成交口径下消失或反号，结论表述必须相应收紧，"
+                             "**不得护着** `16`/`17` 的旧表述。",
+    "forbidden": "① 看到结果后改终点（T+20 → T+10/T+5）或改起点（T+1 开盘 → T+1 均价）；"
+                 "② 把『封板当日买不到』含糊过去（例如拿 T 收盘价当成交价还宣称可成交）；"
+                 "③ 跳过族级多重检验计数；④ 用『换个数据窗口/延长观察期』把数字做漂亮。",
+    "status": "已预注册，**结果尚未产生**",
+}
 DESIGN_V2_REFERENCE = "limit_up_event_study_design@v2"
 DESIGN_V2 = {
     "supersedes": SCAN_REFERENCE,
@@ -296,6 +361,20 @@ def main() -> int:
             exploratory=True, trial_count=1,
             notes="D44 的直接执行：把封单额换成**无量纲的封成比**再验一遍。"
                   "清单、门槛与族级多重检验计数都在看到数字之前写入。")
+
+    if DESIGN_V5_REFERENCE in existing:
+        plan.append(f"skip  {DESIGN_V5_REFERENCE}（已登记）")
+    else:
+        plan.append(f"add   {DESIGN_V5_REFERENCE}（kind=scan, 可成交性检验设计）")
+    if DESIGN_V5_REFERENCE not in existing and not args.dry_run:
+        governance.register_hypothesis(
+            kind="scan", name="涨停池事件研究：可成交性检验（T+1 开盘口径）预注册清单",
+            reference=DESIGN_V5_REFERENCE,
+            definition={**DOMAIN, **DESIGN_V5}, direction="无方向（口径变更登记）",
+            exploratory=True, trial_count=3,
+            notes="D48 的直接执行：把结果窗口起点从 T 收盘改成 **T+1 开盘**，"
+                  "回答『封板当日买不到』扣掉之后还剩多少。三口径、族级计数、"
+                  "除权截断规则（严格晚于买入日）与禁止事项都在**看到数字之前**写入。")
 
     for declaration in DERIVED_FIELD_DECLARATIONS:
         reference = declaration["reference"]

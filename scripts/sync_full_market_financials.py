@@ -17,6 +17,15 @@ import duckdb
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "backend"))
 
+#: 进度行里夹着中文原因文本；重定向到文件时默认码页（本机 GBK）会抛 UnicodeEncodeError，
+#: 让一个跑了很久的同步在**打印那一行**时崩掉。守卫见
+#: `tests/unit/test_script_stdout_encoding.py`。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 from app.main import create_app  # noqa: E402
 from app.market_data.models import RateLimited, SourceNotConfigured  # noqa: E402
 

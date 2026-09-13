@@ -17,7 +17,15 @@ import math
 import pytest
 
 from backend.app.market_warehouse.repository import WarehouseRepository
-from backend.app.screener.events import FIELD_ENCODINGS, LimitUpEventStudy, _t_stat
+from backend.app.screener.events import (
+    ALL_FIELDS,
+    FIELD_ENCODINGS,
+    FIELD_FAMILIES,
+    LimitUpEventStudy,
+    _t_stat,
+    parse_family_prior_statistics,
+    resolve_family_priors,
+)
 
 DAY_MS = 86_400_000
 #: 事件日排在第 75 根 K 线：既要**事前 40 日动量**（需第 61 根），
@@ -363,23 +371,28 @@ def _canonical(value):
     return value
 
 
-def test_panel_and_live_paths_produce_identical_results(repository):
-    """两条通路必须**逐位一致**。
+@pytest.mark.parametrize("basis", ["close_t", "next_open", "next_intraday"])
+def test_panel_and_live_paths_produce_identical_results(repository, basis):
+    """两条通路必须**逐位一致**——对**每一条结果口径**都要成立。
 
     面板把"每个评估日两次全表扫描"换成"一次全表扫描物化"，是纯性能改造；
     只要结果有任何一处不同，这次改造就不合格。这条测试是那个承诺的守卫。
+    可成交口径（v5）新增的列同理：换口径不能顺带换掉数值。
     """
     study = LimitUpEventStudy(repository)
-    live = study.run(field="seal_ratio", horizon_days=20, draws=5, source="live")
-    panel = study.run(field="seal_ratio", horizon_days=20, draws=5, source="panel")
+    live = study.run(field="seal_ratio", horizon_days=20, draws=5, source="live",
+                     return_basis=basis)
+    panel = study.run(field="seal_ratio", horizon_days=20, draws=5, source="panel",
+                      return_basis=basis)
 
     assert live["data_path"]["source"] == "live"
     assert panel["data_path"]["source"] == "panel"
     assert "rebuilt" in panel["data_path"]
+    assert live["outcome_basis"]["id"] == panel["outcome_basis"]["id"] == basis
     for key in ("dates_with_pool", "dates_usable", "events_total", "results", "variants",
-                "by_period", "multiplicity"):
+                "by_period", "multiplicity", "descriptive"):
         left, right = _canonical(live[key]), _canonical(panel[key])
-        assert left == right, f"{key} 不一致：面板会改变结论，不可接受"
+        assert left == right, f"{key} 不一致（口径 {basis}）：面板会改变结论，不可接受"
 
 
 def test_panel_is_reused_and_rebuilt_only_when_the_source_changes(repository):
@@ -444,3 +457,109 @@ def test_empty_pool_returns_a_reason_instead_of_a_fake_conclusion(tmp_path):
     report = LimitUpEventStudy(repository).run(field="continue_day_cnt", draws=5)
     assert report["dates_usable"] == 0
     assert "sync_limit_pools" in report["reason"]
+
+
+# --- 可成交口径（v5）：口径披露 + 描述量不得混进被检验的统计量 ----------------
+
+def test_report_discloses_the_outcome_basis_and_its_design_reference(repository):
+    """口径必须与数字一起披露：同一个 t 值在「T 收盘起算」与「T+1 开盘起算」下含义不同
+    （前者不可成交）。换口径＝换定义，所以也要指明它属于哪一份预注册设计。"""
+    closed = LimitUpEventStudy(repository).run(field="seal_ratio", horizon_days=5, draws=3)
+    opened = LimitUpEventStudy(repository).run(field="seal_ratio", horizon_days=5, draws=3,
+                                               return_basis="next_open")
+
+    assert closed["outcome_basis"]["id"] == "close_t"
+    assert closed["outcome_basis"]["tradable"] is False
+    assert opened["outcome_basis"]["id"] == "next_open"
+    assert opened["outcome_basis"]["tradable"] is True
+    assert "T+1" in opened["outcome_basis"]["buy_point"]
+    assert "limit_up_event_study_design@v1" in closed["design"]
+    assert "limit_up_event_study_design@v5" in opened["design"]
+    # 不可成交这件事必须在限制清单里明说，不能只写在口径块里
+    assert any("买不到" in item for item in closed["limitations"])
+    assert any("T+1" in item for item in opened["limitations"])
+
+
+def test_next_open_gap_is_reported_as_a_descriptive_quantity_not_a_tested_one(repository):
+    """「买不到」的量化要给出来，但**不得**混进被检验的统计量集合里。
+
+    给它一个 t 值会让它自动进入多重检验计数，并诱使读者把它当成第 N 个显著性声明；
+    要当检验端点必须新开 reference（方案 A.1/A.2）。
+    """
+    report = LimitUpEventStudy(repository).run(field="seal_ratio", horizon_days=5, draws=3)
+
+    assert set(report["results"]) == {"high", "low", "high_minus_low"}
+    gap = report["descriptive"]["next_open_gap"]
+    assert gap["t_stat"] is None
+    assert "不入门槛" in gap["group"]
+    assert set(gap) >= {"high_mean", "low_mean", "mean_excess", "events_high", "events_low"}
+    # 每个变体各自带一份描述量（与「每个变体有自己的零分布」同一采集口径）
+    for payload in report["variants"].values():
+        assert "next_open_gap" in payload["descriptive"]
+    # 口径块本身也不能把描述量混进被检验的统计量里
+    assert "next_open_gap" not in report["multiplicity"]["variants"]
+
+
+# --- 族级多重检验计数必须**按字段**给（`17` §4.3 的口径修正）-------------------
+
+def test_every_field_declares_a_family():
+    """新增字段必须声明所属统计族——否则族级计数就没有依据，门槛只能靠人记。
+
+    这条是"防再犯"的守卫：`--field all` 曾经用一个全局计数把封成比的门槛算松
+    （显示 3.023，而按族应为 3.227）。
+    """
+    assert set(FIELD_FAMILIES) == set(ALL_FIELDS)
+    assert FIELD_FAMILIES["seal_money"] == FIELD_FAMILIES["seal_ratio"]
+    assert FIELD_FAMILIES["continue_day_cnt"] != FIELD_FAMILIES["seal_ratio"]
+
+
+def test_family_prior_text_format_parses_both_forms_and_refuses_junk():
+    assert parse_family_prior_statistics("") == 0
+    assert parse_family_prior_statistics("40") == 40
+    assert parse_family_prior_statistics("seal_ratio=40,seal_money=40") == {
+        "seal_ratio": 40, "seal_money": 40}
+    for bad in ("seal_ratio", "=40", "seal_ratio=", "unknown_field=3", "seal_ratio=x"):
+        with pytest.raises(ValueError):
+            parse_family_prior_statistics(bad)
+
+
+def test_per_field_family_prior_refuses_to_silently_default_to_zero():
+    """按字段给时**必须逐个列全**：缺项静默当 0 就是把门槛算松。"""
+    assert resolve_family_priors(20, ("seal_ratio", "continue_day_cnt")) == {
+        "seal_ratio": 20, "continue_day_cnt": 20}
+    assert resolve_family_priors({"seal_ratio": 40, "continue_day_cnt": 20},
+                                 ("seal_ratio", "continue_day_cnt")) == {
+        "seal_ratio": 40, "continue_day_cnt": 20}
+    with pytest.raises(ValueError, match="缺少"):
+        resolve_family_priors({"seal_ratio": 40}, ("seal_ratio", "continue_day_cnt"))
+    with pytest.raises(ValueError, match="不得为负"):
+        resolve_family_priors({"seal_ratio": -1}, ("seal_ratio",))
+
+
+def test_same_family_fields_must_share_one_prior():
+    """同族字段的先验必须一致，否则同一个族的不同口径会有不同门槛，读者无法解释。"""
+    assert resolve_family_priors({"seal_money": 40, "seal_ratio": 40},
+                                 ("seal_money", "seal_ratio")) == {
+        "seal_money": 40, "seal_ratio": 40}
+    with pytest.raises(ValueError, match="同族字段的族级先验不一致"):
+        resolve_family_priors({"seal_money": 20, "seal_ratio": 40},
+                              ("seal_money", "seal_ratio"))
+
+
+def test_family_prior_is_applied_per_field_end_to_end(repository):
+    """端到端：同一个跑批里，封成比与连板高度必须各自拿到自己的族级先验。"""
+    reports = LimitUpEventStudy(repository).run_fields(
+        fields=("seal_ratio", "continue_day_cnt"), horizon_days=5, draws=3,
+        family_prior_statistics={"seal_ratio": 40, "continue_day_cnt": 20})
+
+    seal = reports["seal_ratio"]["multiplicity"]
+    cont = reports["continue_day_cnt"]["multiplicity"]
+    assert seal["family"] == "limit_up_seal_strength"
+    assert cont["family"] == "limit_up_continue_board"
+    assert seal["family_prior_statistics"] == 40
+    assert cont["family_prior_statistics"] == 20
+    assert seal["family_total_statistics"] == seal["statistics_tested"] + 40
+    assert cont["family_total_statistics"] == cont["statistics_tested"] + 20
+    # 族级计数更大 → 门槛更严；这就是"按字段给"与"全局给 20"的实质差别
+    assert seal["bonferroni_family_abs_t"] > cont["bonferroni_family_abs_t"]
+    assert "按字段" in seal["family_counting_note"]
