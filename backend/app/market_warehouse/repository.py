@@ -19,6 +19,26 @@ class WarehouseRepository:
             thscode VARCHAR NOT NULL, ticker VARCHAR, ex_date_ms BIGINT NOT NULL,
             dividend_per_share DOUBLE, per_share_bonus DOUBLE, allotment_ratio DOUBLE,
             allotment_price DOUBLE, currency VARCHAR NOT NULL)""")
+        # 涨跌停/炸板池（第 0 步实测后新增，见 docs/荐股治理方案/14）：
+        # 只能**按交易日逐日**取，因此单列一张表 + 一张"取数台账"。
+        # `limit_pool_sync_days` 的唯一理由：**把三种"空"区分开**——
+        # ① 当天真的没有涨停；② 参数写错被静默忽略（实测写成 `date` 会返回 code=0 且 0 条）；
+        # ③ 超出可回溯范围（涨停池 ≤2019 也是静默 0 条，跌停/炸板则报 1002）。
+        # 没有这张台账，事后无法判断某天的缺失是"没发生"还是"没取到"。
+        db.execute("""CREATE TABLE IF NOT EXISTS limit_pools (
+            date_ms BIGINT NOT NULL, pool VARCHAR NOT NULL, thscode VARCHAR NOT NULL,
+            ticker VARCHAR, name VARCHAR, is_st BOOLEAN, is_new BOOLEAN,
+            last_price DOUBLE, price_change_ratio_pct DOUBLE,
+            continue_day_cnt INTEGER, continue_day_text VARCHAR,
+            seal_money DOUBLE, max_seal_money DOUBLE,
+            limit_up_time VARCHAR, limit_up_reason VARCHAR,
+            fetched_at VARCHAR NOT NULL,
+            PRIMARY KEY (date_ms, pool, thscode))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS limit_pool_sync_days (
+            date_ms BIGINT NOT NULL, pool VARCHAR NOT NULL, status VARCHAR NOT NULL,
+            total INTEGER, fetched INTEGER, pages INTEGER, page_size INTEGER,
+            error_code INTEGER, error_message VARCHAR, fetched_at VARCHAR NOT NULL,
+            PRIMARY KEY (date_ms, pool))""")
         # Earlier local builds assumed (thscode, ex_date_ms) was unique.  The
         # official export can contain more than one distinct action on a day;
         # preserve those events while still collapsing byte-for-byte duplicates.
@@ -388,6 +408,92 @@ class WarehouseRepository:
                 "volume_today", "turnover_20", "volume_20", "ma20", "ma60", "vol20", "bars",
                 "close_20_ago", "close_60_ago", "bonus_20", "div_20", "rights_20", "rights_cost_20",
                 "bonus_60", "div_60", "rights_60", "rights_cost_60", "event_rows")
+        return [dict(zip(keys, row)) for row in rows]
+
+    # --- 涨跌停/炸板池 -------------------------------------------------------
+    def write_limit_pool_day(self, *, date_ms: int, pool: str, rows: list[dict],
+                             status: str, total: int | None, pages: int | None,
+                             page_size: int | None, error_code: int | None,
+                             error_message: str | None, fetched_at: str) -> None:
+        """写入一天的池子内容 + 取数台账（同一事务，幂等覆盖）。"""
+        db = self._connect()
+        try:
+            # DuckDB 默认逐语句自动提交；这里显式开事务以保证"内容 + 台账"同进同出，
+            # 因此**必须显式 commit**——只 close() 会把未提交的事务回滚掉（实测踩过：
+            # 汇总报告写入了 260 行，读回来 0 行）。
+            db.execute("BEGIN")
+            db.execute("DELETE FROM limit_pools WHERE date_ms=? AND pool=?", [date_ms, pool])
+            if rows:
+                db.executemany(
+                    "INSERT INTO limit_pools(date_ms, pool, thscode, ticker, name, is_st, is_new, "
+                    "last_price, price_change_ratio_pct, continue_day_cnt, continue_day_text, "
+                    "seal_money, max_seal_money, limit_up_time, limit_up_reason, fetched_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [(date_ms, pool, row.get("thscode"), row.get("ticker"), row.get("name"),
+                      row.get("is_st"), row.get("is_new"), row.get("last_price"),
+                      row.get("price_change_ratio_pct"), row.get("continue_day_cnt"),
+                      row.get("continue_day_text"), row.get("seal_money"),
+                      row.get("max_seal_money"), row.get("limit_up_time"),
+                      row.get("limit_up_reason"), fetched_at) for row in rows])
+            db.execute(
+                "INSERT OR REPLACE INTO limit_pool_sync_days(date_ms, pool, status, total, fetched, "
+                "pages, page_size, error_code, error_message, fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                [date_ms, pool, status, total, len(rows), pages, page_size, error_code,
+                 error_message, fetched_at])
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def limit_pool_rows(self, *, pool: str, date_ms: int | None = None,
+                        start_ms: int | None = None, end_ms: int | None = None) -> list[dict]:
+        """读取已落库的池子内容。**不联网、不取数**——取数由脚本显式触发。"""
+        if not self.path.exists():
+            return []
+        clauses, params = ["pool = ?"], [pool]
+        if date_ms is not None:
+            clauses.append("date_ms = ?")
+            params.append(date_ms)
+        if start_ms is not None:
+            clauses.append("date_ms >= ?")
+            params.append(start_ms)
+        if end_ms is not None:
+            clauses.append("date_ms <= ?")
+            params.append(end_ms)
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            rows = db.execute(
+                f"SELECT * FROM limit_pools WHERE {' AND '.join(clauses)} "  # noqa: S608 - 固定子句
+                "ORDER BY date_ms, thscode", params).fetchall()
+        except duckdb.CatalogException:
+            return []
+        finally:
+            db.close()
+        keys = ("date_ms", "pool", "thscode", "ticker", "name", "is_st", "is_new", "last_price",
+                "price_change_ratio_pct", "continue_day_cnt", "continue_day_text", "seal_money",
+                "max_seal_money", "limit_up_time", "limit_up_reason", "fetched_at")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def limit_pool_sync_days(self, *, pool: str | None = None) -> list[dict]:
+        """取数台账：每天都记录 status/total/fetched/error_code，用于区分三种"空"。"""
+        if not self.path.exists():
+            return []
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            if pool:
+                rows = db.execute("SELECT * FROM limit_pool_sync_days WHERE pool=? "
+                                  "ORDER BY date_ms", [pool]).fetchall()
+            else:
+                rows = db.execute("SELECT * FROM limit_pool_sync_days "
+                                  "ORDER BY date_ms, pool").fetchall()
+        except duckdb.CatalogException:
+            return []
+        finally:
+            db.close()
+        keys = ("date_ms", "pool", "status", "total", "fetched", "pages", "page_size",
+                "error_code", "error_message", "fetched_at")
         return [dict(zip(keys, row)) for row in rows]
 
     def settlement_returns(self, *, date_ms: int, horizon_days: int) -> list[dict]:
