@@ -11,7 +11,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .agent.model_factory import ModelFactory
 from .agent.research_graph import FactoryModelAdapter, ResearchGraph
-from .api import advisor as advisor_api, api_config, company, exports, funds, indices, kb as kb_api, library, market_data, market_research, market_review, market_warehouse, model_config, research as research_api, rss as rss_api, sectors, sources as sources_api, strategy as strategy_api, supplements as supplements_api, system, watchlist
+from .api import advisor as advisor_api, api_config, company, exports, funds, governance as governance_api, indices, kb as kb_api, library, market_data, market_research, market_review, market_warehouse, model_config, research as research_api, rss as rss_api, sectors, sources as sources_api, strategy as strategy_api, supplements as supplements_api, system, watchlist
 from .api_config.repository import ApiRepository
 from .api_config.service import ApiConfigService
 from .credentials import CredentialRoot
@@ -38,6 +38,7 @@ from .research.tasks import TaskStore
 from .security import LocalSecurityMiddleware, error_response
 from .settings import Settings, load_settings
 from .storage import Storage
+from .governance.service import GovernanceService
 from .strategy.service import StrategyService
 
 
@@ -54,6 +55,7 @@ def create_app(settings: Settings | None = None, *, transport: httpx.AsyncBaseTr
         storage.initialize()
         app.state.settings = settings
         app.state.storage = storage
+        app.state.governance = GovernanceService(storage)
         app.state.session_token = secrets.token_urlsafe(32)
         root = CredentialRoot(storage, settings)
         app.state.credentials = root
@@ -198,6 +200,7 @@ def create_app(settings: Settings | None = None, *, transport: httpx.AsyncBaseTr
     app.include_router(kb_api.router)
     app.include_router(advisor_api.router)
     app.include_router(strategy_api.router)
+    app.include_router(governance_api.router)
     app.include_router(rss_api.router)
     app.include_router(sources_api.router)
     return app

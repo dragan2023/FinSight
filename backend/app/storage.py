@@ -5,7 +5,7 @@ from typing import Iterator
 
 # 当前 Schema 版本：迁移链的最后一级与版本守卫共用此常量，
 # 新增迁移时只改这里与对应的 `if version < N` 块。
-CURRENT_SCHEMA_VERSION = 31
+CURRENT_SCHEMA_VERSION = 32
 
 
 class Storage:
@@ -689,3 +689,140 @@ class Storage:
                 if "failure_message" not in columns:
                     db.execute("ALTER TABLE market_sync_runs ADD COLUMN failure_message TEXT")
                 db.execute("PRAGMA user_version = 31")
+            if version < 32:
+                # C1 治理层（方案 02 §4/§5，G1–G4）：把"规则在评估期内不可改写"从文档
+                # 变成**程序拒绝**。四张表 + 两个 BEFORE UPDATE 触发器（触发器是最后一道
+                # 防线：任何绕过服务层的直接 SQL 也会被 SQLite 拒绝）。
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS hypothesis_registry (
+                        id TEXT PRIMARY KEY,
+                        reference TEXT NOT NULL UNIQUE,
+                        kind TEXT NOT NULL CHECK(kind IN ('strategy','factor','rule','scan')),
+                        name TEXT NOT NULL,
+                        definition_json TEXT NOT NULL,
+                        direction TEXT NOT NULL DEFAULT '',
+                        params_json TEXT NOT NULL DEFAULT '{}',
+                        params_hash TEXT NOT NULL,
+                        submitted_at TEXT NOT NULL,
+                        frozen_at TEXT,
+                        status TEXT NOT NULL CHECK(status IN ('draft','frozen','retired')),
+                        exploratory INTEGER NOT NULL DEFAULT 0 CHECK(exploratory IN (0,1)),
+                        trial_count INTEGER NOT NULL DEFAULT 1,
+                        notes TEXT NOT NULL DEFAULT ''
+                    )
+                """)
+                db.execute("CREATE INDEX IF NOT EXISTS hypothesis_registry_status_idx "
+                           "ON hypothesis_registry(status, submitted_at DESC)")
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS evaluation_batches (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        plan_json TEXT NOT NULL DEFAULT '{}',
+                        stop_criteria_json TEXT NOT NULL DEFAULT '{}',
+                        started_at TEXT NOT NULL,
+                        closed_at TEXT,
+                        status TEXT NOT NULL CHECK(status IN ('open','frozen','closed')),
+                        verdict_json TEXT,
+                        superseded_by TEXT,
+                        exploratory INTEGER NOT NULL DEFAULT 0 CHECK(exploratory IN (0,1))
+                    )
+                """)
+                db.execute("CREATE INDEX IF NOT EXISTS evaluation_batches_status_idx "
+                           "ON evaluation_batches(status, started_at DESC)")
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS batch_members (
+                        batch_id TEXT NOT NULL REFERENCES evaluation_batches(id) ON DELETE CASCADE,
+                        artifact_kind TEXT NOT NULL CHECK(artifact_kind IN
+                            ('advice','prediction','experiment','scan','hypothesis')),
+                        artifact_id TEXT NOT NULL,
+                        added_at TEXT NOT NULL,
+                        PRIMARY KEY (batch_id, artifact_kind, artifact_id)
+                    )
+                """)
+                db.execute("CREATE INDEX IF NOT EXISTS batch_members_artifact_idx "
+                           "ON batch_members(artifact_kind, artifact_id)")
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS rule_change_log (
+                        id TEXT PRIMARY KEY,
+                        batch_id TEXT,
+                        changed_at TEXT NOT NULL,
+                        field TEXT NOT NULL,
+                        old_hash TEXT NOT NULL DEFAULT '',
+                        new_hash TEXT NOT NULL DEFAULT '',
+                        reason TEXT NOT NULL,
+                        hypothesis_id TEXT,
+                        replacement_id TEXT,
+                        forced_new_batch_id TEXT REFERENCES evaluation_batches(id)
+                    )
+                """)
+                db.execute("CREATE INDEX IF NOT EXISTS rule_change_log_batch_idx "
+                           "ON rule_change_log(batch_id, changed_at DESC)")
+                # 规则定义列一旦冻结即不可改写。允许的迁移只有 status/frozen_at/notes/
+                # trial_count（生命周期与注释），它们不构成"改规则"。
+                db.execute("""
+                    CREATE TRIGGER IF NOT EXISTS hypothesis_registry_frozen_update
+                    BEFORE UPDATE ON hypothesis_registry
+                    FOR EACH ROW
+                    WHEN OLD.status = 'frozen' AND (
+                        NEW.reference <> OLD.reference
+                        OR NEW.kind <> OLD.kind
+                        OR NEW.name <> OLD.name
+                        OR NEW.definition_json <> OLD.definition_json
+                        OR NEW.direction <> OLD.direction
+                        OR NEW.params_json <> OLD.params_json
+                        OR NEW.params_hash <> OLD.params_hash)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'hypothesis_frozen_immutable');
+                    END
+                """)
+                db.execute("""
+                    CREATE TRIGGER IF NOT EXISTS hypothesis_registry_batch_frozen_update
+                    BEFORE UPDATE ON hypothesis_registry
+                    FOR EACH ROW
+                    WHEN (NEW.reference <> OLD.reference
+                        OR NEW.kind <> OLD.kind
+                        OR NEW.name <> OLD.name
+                        OR NEW.definition_json <> OLD.definition_json
+                        OR NEW.direction <> OLD.direction
+                        OR NEW.params_json <> OLD.params_json
+                        OR NEW.params_hash <> OLD.params_hash)
+                    AND EXISTS (
+                        SELECT 1 FROM evaluation_batches b
+                        JOIN batch_members m ON m.batch_id = b.id
+                        WHERE m.artifact_kind = 'hypothesis' AND m.artifact_id = OLD.id
+                          AND b.status = 'frozen')
+                    BEGIN
+                        SELECT RAISE(ABORT, 'batch_frozen_immutable');
+                    END
+                """)
+                db.execute("""
+                    CREATE TRIGGER IF NOT EXISTS hypothesis_registry_frozen_delete
+                    BEFORE DELETE ON hypothesis_registry
+                    FOR EACH ROW WHEN OLD.status = 'frozen'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'hypothesis_frozen_no_delete');
+                    END
+                """)
+                db.execute("""
+                    CREATE TRIGGER IF NOT EXISTS evaluation_batches_closed_immutable
+                    BEFORE UPDATE ON evaluation_batches
+                    FOR EACH ROW
+                    WHEN OLD.status = 'closed' AND (
+                        NEW.plan_json <> OLD.plan_json
+                        OR NEW.stop_criteria_json <> OLD.stop_criteria_json
+                        OR NEW.name <> OLD.name)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'batch_closed_immutable');
+                    END
+                """)
+                # G7 审计完备：每条建议/预测必须能回答"它属于哪个评估批次"。
+                # 直接落在业务表上（而不是只靠 batch_members），这样任何一条台账记录
+                # 单独拿出来也自证批次，缺批次就无法登记（见 AdvisorLedger.register）。
+                for table in ("advice_ledger", "research_predictions"):
+                    columns = {row["name"] for row in
+                               db.execute(f"PRAGMA table_info({table})").fetchall()}
+                    if "batch_id" not in columns:
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN batch_id TEXT")
+                db.execute("CREATE INDEX IF NOT EXISTS advice_ledger_batch_idx "
+                           "ON advice_ledger(batch_id, created_at DESC)")
+                db.execute("PRAGMA user_version = 32")

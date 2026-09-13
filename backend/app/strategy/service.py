@@ -3,6 +3,7 @@ import hashlib,json
 from datetime import datetime,timezone
 from uuid import uuid4
 from ..errors import AppError
+from ..governance.service import GovernanceService
 from ..storage import Storage
 from ..advisor.ledger import AdvisorLedger
 from .backtest import current_signal_snapshot,metrics,run_backtest,segments,year_segments
@@ -11,7 +12,8 @@ from .registry import get_spec,list_specs
 from .validation import grade
 
 class StrategyService:
- def __init__(self,storage:Storage,market): self.storage=storage; self.market=market
+ def __init__(self,storage:Storage,market):
+  self.storage=storage; self.market=market; self._governance=GovernanceService(storage)
  def specs(self):
   items=[x.model_dump() for x in list_specs()]
   with self.storage.connect() as db:
@@ -25,13 +27,16 @@ class StrategyService:
     item["lifecycle"]={"validated":"validated","retire":"retired","keep_candidate":"candidate"}[decision]
   return items
  async def run(self,data:StrategyExperimentInput):
+  # G1 预注册门禁：未登记或未冻结的策略不得进入候选生成。放在取数之前，
+  # 既避免无谓的外部调用，也让"没登记就跑不了"成为一条硬规则而不是提醒。
+  spec=get_spec(data.strategy_id)
+  self._governance.assert_runnable(f"{spec.id}@{spec.version}")
   self.market.require_stock_identity(data.thscode); result=await self.market.fetch_price_history(data.thscode,start_ms=data.start_ms,end_ms=data.end_ms,adjust="forward",refresh=data.refresh)
   bars=[]
   for record in result.records:
    fields=record.get("fields",{}); close=(fields.get("close_price") or {}).get("value"); opening=(fields.get("open_price") or {}).get("value")
    if close is not None: bars.append(PriceBar(date=str(record["period_key"])[:10],open=float(opening) if opening is not None else None,close=float(close)))
   if not bars: raise AppError("data_unavailable","没有可用的前复权日K收盘价，无法生成实验。",409)
-  spec=get_spec(data.strategy_id)
   if spec.family=="risk_overlay": raise AppError("strategy_not_runnable","风险覆盖层只作为其他策略的风险规则，不能单独运行实验。",422)
   if len(bars)>3000: raise AppError("strategy_invalid","有效日K超过3000根上限，拒绝保存。",422)
   structural=self._structural_errors(bars)

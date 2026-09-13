@@ -17,6 +17,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..errors import AppError
+from ..governance.service import GovernanceService
 from ..storage import Storage
 from .ledger import HORIZON_MS, _base_cutoff_date, _date_to_ms, _independent_observations, _now_iso, _shift_date
 
@@ -92,8 +93,10 @@ class ResearchPredictionLedger:
         self._storage = storage
 
     # -- 封存 ----------------------------------------------------------------
-    def seal(self, payload: dict) -> dict:
+    def seal(self, payload: dict, *, batch_id: str | None = None) -> dict:
+        """封存一条研究预测；与研究轨同样受 G4 批次隔离约束（无进行中批次即拒绝）。"""
         item = ResearchPredictionInput.model_validate(payload)
+        batch_id = batch_id or GovernanceService(self._storage).require_current_batch_id()
         with self._storage.connect() as db:
             if item.linked_advice_id:
                 linked = db.execute("SELECT id FROM advice_ledger WHERE id=?",
@@ -136,8 +139,8 @@ class ResearchPredictionLedger:
                 "p_up, p_flat, p_down, dominant_scenario, event, return_threshold_pct, "
                 "probability_source, rationale, counter_evidence_json, invalidations_json, "
                 "evidence_snapshot_json, evidence_hash, record_hash, model_profile_id, "
-                "prompt_version, linked_advice_id, status, created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "prompt_version, linked_advice_id, status, created_at, batch_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (entry_id, item.source, item.thscode, item.name, item.as_of_date, item.horizon,
                  item.p_up, item.p_flat, item.p_down, dominant, _EVENTS[dominant],
                  item.return_threshold_pct, item.probability_source, item.rationale,
@@ -145,7 +148,7 @@ class ResearchPredictionLedger:
                  json.dumps(list(item.invalidations), ensure_ascii=False),
                  json.dumps(evidence_snapshot, ensure_ascii=False), evidence_hash,
                  record_hash, item.model_profile_id, item.prompt_version,
-                 item.linked_advice_id, "sealed", now))
+                 item.linked_advice_id, "sealed", now, batch_id))
         return self.get(entry_id)
 
     # -- 读取 ----------------------------------------------------------------
