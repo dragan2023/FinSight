@@ -9,6 +9,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..advisor.dual_track import DualTrackLedger
 from ..advisor.graph import AdvisorGraph
 from ..advisor.ledger import AdvisorLedger
 from ..advisor.research_track import ResearchPredictionInput, ResearchPredictionLedger
@@ -216,6 +217,55 @@ async def ledger_settle_eligible(payload: LedgerSettleEligibleInput, request: Re
 
 def _research_track(request: Request) -> ResearchPredictionLedger:
     return request.app.state.research_predictions
+
+
+# -- 双轨独立结算（方案 02 §4）------------------------------------------------
+def _dual_track(request: Request) -> DualTrackLedger:
+    return DualTrackLedger(request.app.state.storage)
+
+
+def _warehouse_repository(request: Request):
+    return request.app.state.market_warehouse.repository
+
+
+@router.get("/dual-track/records")
+async def dual_track_records(request: Request, track: str | None = None,
+                             status: str | None = None, batch_id: str | None = None,
+                             limit: int = Query(default=200, ge=1, le=2000)):
+    if track is not None and track not in ("strategy", "ai"):
+        raise AppError("invalid_track", "轨道只支持 strategy 或 ai。", 422)
+    if status is not None and status not in ("sealed", "settled", "void"):
+        raise AppError("invalid_status", "双轨状态过滤值不支持。", 422)
+    return {"records": _dual_track(request).list(track=track, status=status,
+                                                 batch_id=batch_id, limit=limit)}
+
+
+@router.get("/dual-track/advice/{advice_id}")
+async def dual_track_for_advice(advice_id: str, request: Request):
+    return {"records": _dual_track(request).for_advice(advice_id)}
+
+
+@router.get("/dual-track/due")
+async def dual_track_due(request: Request):
+    return {"due": _dual_track(request).due()}
+
+
+@router.post("/dual-track/{settlement_id}/settle")
+async def dual_track_settle(settlement_id: str, request: Request):
+    """结算**一条**轨道。两轨各自独立，互不依赖——这是双轨设计的要点。"""
+    return {"record": _dual_track(request).settle(settlement_id, _warehouse_repository(request))}
+
+
+@router.post("/dual-track/settle-due")
+async def dual_track_settle_due(payload: LedgerSettleEligibleInput, request: Request):
+    return _dual_track(request).settle_due(_warehouse_repository(request),
+                                           confirmed=payload.confirmed)
+
+
+@router.get("/dual-track/margin")
+async def dual_track_margin(request: Request, batch_id: str | None = None):
+    """两轨对比表 + LLM 的边际贡献（= 两轨差值）+ 预注册停止条件判定。"""
+    return {"report": _dual_track(request).evaluate_stop_criteria(batch_id=batch_id)}
 
 
 # -- research predictions（双轨封存：研究预测轨，登记即封存） ------------------

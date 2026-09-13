@@ -14,6 +14,7 @@ from ..errors import AppError
 from ..governance.service import GovernanceService
 from ..storage import Storage
 from ..strategy.registry import get_spec
+from .dual_track import DualTrackLedger
 from .output_models import tier_gate_snapshot, upgrade_suggestion_view
 
 HORIZON_MS = {
@@ -165,12 +166,16 @@ class AdvisorLedger:
                  evidence: list[dict] | None = None,
                  model_profile_id: str | None = None,
                  prompt_version: str = PROMPT_VERSION,
-                 batch_id: str | None = None) -> dict:
-        """登记一条执行建议。
+                 batch_id: str | None = None,
+                 raw_verdict: dict | None = None) -> dict:
+        """登记一条执行建议，并为它封存两条**可独立结算**的轨。
 
         G4 批次隔离：**没有进行中的评估批次就拒绝登记**（方案 02 §4 约束 4：
         「advisor/graph.py 在登记建议时强制写入 batch_id，缺失则拒绝登记」）。
         `session_id` 与建议无关，批次才是它的归属；两者不可互相替代。
+
+        `raw_verdict` 是门禁改写之前的 LLM 原始裁决（方案 02 §4 双轨要求）。
+        缺省为 None 时 AI 轨会记为"无可结算裁决"，绝不拿被改写的卡片冒充。
         """
         from uuid import uuid4
         entry_id = uuid4().hex
@@ -188,8 +193,8 @@ class AdvisorLedger:
                 "INSERT INTO advice_ledger(id, session_id, thscode, name, direction, confidence, "
                 "horizon, card_json, evidence_json, params_hash, strategy_ref_json, forecast_event_json, "
                 "confidence_basis_json, evidence_hash, strategy_forecast_json, prompt_version, "
-                "model_profile_id, tier_snapshot_json, status, created_at, batch_id) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'tracking',?,?)",
+                "model_profile_id, tier_snapshot_json, status, created_at, batch_id, llm_verdict_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'tracking',?,?,?)",
                 (entry_id, session_id, card["thscode"], card["name"], card["direction"],
                  card["confidence"], card["horizon"],
                  json.dumps(card, ensure_ascii=False), evidence_json, _params_hash(card),
@@ -199,9 +204,19 @@ class AdvisorLedger:
                  hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()[:16],
                  json.dumps(strategy_forecasts, ensure_ascii=False), prompt_version,
                  model_profile_id,
-                 json.dumps(tier_gate_snapshot(card), ensure_ascii=False), now, batch_id))
+                 json.dumps(tier_gate_snapshot(card), ensure_ascii=False), now, batch_id,
+                 json.dumps(raw_verdict, ensure_ascii=False) if raw_verdict is not None else None))
         # 同时进入批次成员表，使 batch_statistics 能按批次聚合（G4）。
         governance.add_member(batch_id=batch_id, artifact_kind="advice", artifact_id=entry_id)
+        # 双轨封存：两轨共享同一个 as_of 与到期窗口，否则差值不是在比同一个市场区间。
+        signal_as_of = next((item.get("signal_as_of") for item in strategy_forecasts
+                             if item.get("signal_as_of")), None)
+        as_of_date = str(signal_as_of)[:10] if signal_as_of else _shanghai_date(now)
+        DualTrackLedger(self._storage).seal(
+            advice_id=entry_id, batch_id=batch_id, thscode=card["thscode"],
+            horizon_days=horizon_days, as_of_date=as_of_date,
+            as_of_basis=("candidate_signal_snapshot" if signal_as_of else "registration_date"),
+            strategy_forecasts=strategy_forecasts, raw_verdict=raw_verdict, created_at=now)
         return self.get(entry_id)
 
     def get(self, entry_id: str) -> dict:

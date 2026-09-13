@@ -292,6 +292,10 @@ class AdvisorGraph:
                     phase("audit", "检测到策略冲突但审计预算已用尽，直接按服务器规则降级。")
             checkpoint("synthesized", card=card.model_dump())
 
+        # 双轨独立结算的前提：**门禁改写之前的**原始 LLM 裁决必须留档。
+        # `_enrich_card()` 会把"候选为空/存在冲突"改写成 wait 并压低把握度，
+        # 用改写后的卡片做"AI 轨"等于拿被治理层修剪过的结果去评价治理层。
+        raw_verdict = card.model_dump()
         card = self._enrich_card(card, pack, conflicts=conflicts)
         evidence = _public_evidence(pack)
         if reached("registered"):
@@ -299,7 +303,8 @@ class AdvisorGraph:
         else:
             entry = self._ledger.register(
                 card.model_dump(), session_id=session_id, evidence=evidence,
-                model_profile_id=getattr(self._model, "profile_id", None))
+                model_profile_id=getattr(self._model, "profile_id", None),
+                raw_verdict=raw_verdict)
             advice_id = entry["id"]
             checkpoint("registered", advice_id=advice_id)
         research_prediction_id = None

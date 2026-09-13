@@ -5,7 +5,7 @@ from typing import Iterator
 
 # 当前 Schema 版本：迁移链的最后一级与版本守卫共用此常量，
 # 新增迁移时只改这里与对应的 `if version < N` 块。
-CURRENT_SCHEMA_VERSION = 32
+CURRENT_SCHEMA_VERSION = 33
 
 
 class Storage:
@@ -826,3 +826,65 @@ class Storage:
                 db.execute("CREATE INDEX IF NOT EXISTS advice_ledger_batch_idx "
                            "ON advice_ledger(batch_id, created_at DESC)")
                 db.execute("PRAGMA user_version = 32")
+            if version < 33:
+                # C1 双轨独立结算（方案 02 §4）。要回答的问题是：
+                # "如果把 LLM 换成抛硬币，结果会更好还是更差"——所以必须把
+                # **门禁改写之前**的 LLM 原始裁决与**策略确定性原始信号**各自
+                # 存成独立、可独立结算的记录，而不是只留被压成 wait 的最终卡。
+                columns = {row["name"] for row in db.execute("PRAGMA table_info(advice_ledger)").fetchall()}
+                if "llm_verdict_json" not in columns:
+                    # 门禁（_enrich_card）改写前的原始 LLM 裁决；缺失即为历史数据。
+                    db.execute("ALTER TABLE advice_ledger ADD COLUMN llm_verdict_json TEXT")
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS track_settlements (
+                        id TEXT PRIMARY KEY,
+                        advice_id TEXT NOT NULL,
+                        batch_id TEXT,
+                        track TEXT NOT NULL CHECK(track IN ('strategy','ai')),
+                        thscode TEXT NOT NULL,
+                        horizon_days INTEGER NOT NULL,
+                        as_of_date TEXT NOT NULL,
+                        as_of_basis TEXT NOT NULL DEFAULT '',
+                        due_date TEXT,
+                        direction TEXT NOT NULL,
+                        confidence TEXT NOT NULL DEFAULT '',
+                        probability_json TEXT NOT NULL DEFAULT '{}',
+                        return_threshold_pct REAL NOT NULL DEFAULT 0.2,
+                        eligible INTEGER NOT NULL DEFAULT 1 CHECK(eligible IN (0,1)),
+                        ineligible_reason TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL CHECK(status IN ('sealed','settled','void')),
+                        settled_at TEXT,
+                        settlement_json TEXT,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(advice_id, track)
+                    )
+                """)
+                db.execute("CREATE INDEX IF NOT EXISTS track_settlements_track_idx "
+                           "ON track_settlements(track, status, as_of_date DESC)")
+                db.execute("CREATE INDEX IF NOT EXISTS track_settlements_batch_idx "
+                           "ON track_settlements(batch_id, track)")
+                # 已结算的轨道是历史事实：方案 02 §10「不为得到更好统计而修改已封存的
+                # 预测」。改结论会同时作废两轨的差值，因此直接拒绝。
+                db.execute("""
+                    CREATE TRIGGER IF NOT EXISTS track_settlements_settled_immutable
+                    BEFORE UPDATE ON track_settlements
+                    FOR EACH ROW
+                    WHEN OLD.status = 'settled' AND (
+                        NEW.track <> OLD.track
+                        OR NEW.direction <> OLD.direction
+                        OR NEW.probability_json <> OLD.probability_json
+                        OR NEW.eligible <> OLD.eligible
+                        OR NEW.settlement_json IS NOT OLD.settlement_json)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'track_settlement_immutable');
+                    END
+                """)
+                db.execute("""
+                    CREATE TRIGGER IF NOT EXISTS track_settlements_settled_no_delete
+                    BEFORE DELETE ON track_settlements
+                    FOR EACH ROW WHEN OLD.status = 'settled'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'track_settlement_no_delete');
+                    END
+                """)
+                db.execute("PRAGMA user_version = 33")
