@@ -121,11 +121,11 @@ def test_seal_money_splits_at_the_intraday_pool_median_not_an_absolute_amount(re
 def test_control_group_excludes_limit_up_names_themselves(repository):
     """对照必须是**非涨停**标的：把自己当对照会把超额压成 0。"""
     study = LimitUpEventStudy(repository)
-    detail = study._study_date(EVENT_DAY, {symbol: {"thscode": symbol, "continue_day_cnt": 1}
+    result = study._study_date(EVENT_DAY, {symbol: {"thscode": symbol, "continue_day_cnt": 1}
                                            for symbol in POOL},
-                               horizon_days=5, field="continue_day_cnt", draws=3,
+                               horizon_days=5, fields=("continue_day_cnt",), draws=3,
                                rng=__import__("random").Random(1), pool_union=set(POOL))
-    assert detail is not None
+    detail = result["continue_day_cnt"]
     # 30 只标的里 6 只涨停 → 对照最多 24 只（**涨停标的不得出现在自己的对照里**）
     assert detail["control_size"] == 24
 
@@ -135,14 +135,76 @@ def test_permutation_placebo_keeps_sample_size_and_decile_matching(repository):
     detail = study._study_date(EVENT_DAY, {symbol: {"thscode": symbol,
                                                     "continue_day_cnt": CONTINUE_DAYS[index]}
                                            for index, symbol in enumerate(POOL)},
-                               horizon_days=5, field="continue_day_cnt", draws=7,
+                               horizon_days=5, fields=("continue_day_cnt",), draws=7,
                                rng=__import__("random").Random(2), pool_union=set(POOL))
+    assert detail["continue_day_cnt"]["high_events"] == 3
+    detail = detail["continue_day_cnt"]
     assert len(detail["permuted"]["high"]) == 7
     assert len(detail["permuted"]["low"]) == 7
     # 置换后的日均超额由"同期对照标的"算出，必然落在对照收益的取值范围内
     for value in detail["permuted"]["high"]:
         assert value == value                       # 不是 NaN
         assert abs(value) < 1.0
+
+
+def test_permutation_null_is_reported_for_the_group_difference_too(repository):
+    """「连板高度没有区分度」这句话必须有自己的零分布，否则它只是没算过。"""
+    report = LimitUpEventStudy(repository).run(field="continue_day_cnt", horizon_days=5,
+                                               draws=5)
+    groups = report["placebo"]["permutation"]["by_group"]
+    assert set(groups) == {"high", "low", "high_minus_low"}
+    for stat in groups.values():
+        assert "real_t" in stat and "t_abs_p95" in stat
+
+
+def test_date_shift_placebo_uses_the_same_paired_estimator_as_the_main_statistic(repository):
+    """回归守卫（第一版的错就在这里）。
+
+    第一版日期错位用**全市场均值**当基准，而主统计量用**同十分位对照均值**——两者不是
+    同一个量，实测 |t| 95 分位冲到 10.08，看起来像"主结果不显著"，其实是基准不一致。
+
+    构造一个**差分测试**：让池内标的的收益恰好等于它所在十分位的对照均值（配对超额恒为 0），
+    同时让全市场均值与之相差很远且逐日变化。
+    - 正确的实现（配对估计量）→ 每日超额恒 0 → 零离散度 → 给不出 t 值 → draws == 0；
+    - 错误实现（全市场均值）→ 逐日变化的非零超额 → 能算出 t 值 → draws > 0。
+    """
+    study = LimitUpEventStudy(repository)
+    dates = list(range(1, 41))
+    per_date = {}
+    for index, date_ms in enumerate(dates):
+        value = 0.01 + 0.001 * index
+        per_date[date_ms] = {
+            "pool_codes": ["A.SZ"],
+            "pool_returns": {"A.SZ": value},
+            "bucket_by_symbol": {"A.SZ": 0},
+            "bucket_mean": {0: value},          # ← 配对超额恒为 0
+            "market_mean": value + 500 + index,  # ← 全市场均值刻意相差很远且逐日变化
+        }
+    shift = study._date_shift_placebo(per_date, dates, draws=10, seed=7)
+    assert shift["draws"] == 0, "配对超额恒为 0 时不该算出任何 t 值（否则说明用错了基准）"
+    assert shift["t_abs_p95"] is None
+
+
+def test_date_shift_placebo_does_detect_a_shifted_cohort_that_really_differs(repository):
+    """反向对照：平移过来的标的若稳定跑赢同档对照，|t| 必须抓得到。
+
+    没有这一条，"日期错位给不出 t 值"就可能是因为实现整个失效了，而不是因为对照配得准。
+    """
+    study = LimitUpEventStudy(repository)
+    dates = list(range(1, 41))
+    per_date = {}
+    for index, date_ms in enumerate(dates):
+        # 逐日有波动（否则零离散度），但**稳定**跑赢同档对照 3 个百分点
+        per_date[date_ms] = {
+            "pool_codes": ["A.SZ"],
+            "pool_returns": {"A.SZ": 0.05 + (0.01 if index % 2 else -0.01)},
+            "bucket_by_symbol": {"A.SZ": 0},
+            "bucket_mean": {0: 0.02},
+            "market_mean": 0.0,
+        }
+    shift = study._date_shift_placebo(per_date, dates, draws=10, seed=3)
+    assert shift["draws"] > 0
+    assert shift["t_abs_p95"] is not None and shift["t_abs_p95"] > 1.96
 
 
 # --- 报告纪律 --------------------------------------------------------------

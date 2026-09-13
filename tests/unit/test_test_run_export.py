@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,24 @@ from backend.app.governance.test_run_export import (DISCLAIMER, SCHEMA_VERSION,
 from backend.app.storage import Storage
 
 THSCODE = "601799.SH"
+CST = timezone(timedelta(hours=8))
+
+
+def _today() -> str:
+    """当前的 **Asia/Shanghai** 自然日。
+
+    导出按 CST 自然日过滤 `created_at`，而 `AdvisorLedger.register` 用的是**当前时刻**。
+    所以测试若把导出日期写死成某一天，就只有在"跑测试那天恰好是那一天"时才会通过——
+    2026-09-14 00:20 跑全量时这个坑当场暴露（advice 落在 09-14，导出的是 09-13，
+    于是 kinds 里一条 advice 都没有）。**日期必须由运行时刻算出来，不能写死。**
+    """
+    return datetime.now(CST).strftime("%Y-%m-%d")
+
+
+def _cst_noon_utc(date_str: str) -> str:
+    """该 CST 自然日正午对应的 UTC ISO：保证落进当天的导出窗口，且不依赖运行时刻。"""
+    return (datetime.strptime(date_str, "%Y-%m-%d")
+            .replace(tzinfo=CST, hour=12).astimezone(timezone.utc).isoformat())
 
 
 @pytest.fixture
@@ -67,14 +86,15 @@ def _insert_experiment(storage: Storage, entry_id: str, *, created_at: str) -> N
 def test_export_writes_three_files_with_the_expected_shapes(storage, exporter):
     GovernanceService(storage).open_batch(name="落盘测试批次")
     AdvisorLedger(storage).register(_card(), raw_verdict={"direction": "accumulate"})
-    _insert_experiment(storage, "exp-1", created_at="2026-09-13T01:00:00+00:00")
+    day = _today()
+    _insert_experiment(storage, "exp-1", created_at=_cst_noon_utc(day))
 
-    result = exporter.export(date="2026-09-13")
+    result = exporter.export(date=day)
 
     names = {item["name"] for item in result["files"]}
     assert names == {"daily.md", "daily.jsonl", "batch.json"}
     directory = Path(result["directory"])
-    assert directory.name == "2026-09-13"
+    assert directory.name == day
     assert (directory / "daily.md").is_file()
 
     # 报告的字节数必须等于磁盘实际字节数（防止换行翻译等静默差异）
@@ -106,9 +126,10 @@ def test_batch_json_carries_the_audit_triple(storage, exporter):
     """审计三元组：params_hash、数据快照 sha256、模型配置 ID。"""
     GovernanceService(storage).open_batch(name="审计测试批次")
     AdvisorLedger(storage).register(_card(), model_profile_id="profile-42")
-    _insert_experiment(storage, "exp-a", created_at="2026-09-13T01:00:00+00:00")
+    day = _today()
+    _insert_experiment(storage, "exp-a", created_at=_cst_noon_utc(day))
 
-    exporter.export(date="2026-09-13")
+    exporter.export(date=day)
     audit = json.loads((Path(exporter.list_runs()[0]["path"]) / "batch.json").read_text("utf-8"))
 
     assert audit["audit"]["model_profile_ids"] == ["profile-42"]
