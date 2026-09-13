@@ -52,10 +52,18 @@ def total_return(row: dict) -> float:
 
     提成模块级函数是为了让事件研究（`screener/events.py`）与横截面 IC **共用同一个口径**——
     两处各写一遍迟早会漂移，而"总收益到底怎么算"是这套评价的地基。
+
+    ⚠️ **2026-09-14 修正**：此前实现写成 `(1 + 送股)`，**漏掉配股比例**，与上面这行
+    docstring、以及仓库里 P0-1 验证过的规范式子（`repository` 的
+    `corporate_action_total_return_history`：`(close×(1+送股+配股)+分红−配股成本)/prev_close`）
+    都不一致。后果：窗口内**有配股**的标的收益被系统性低估——
+    只减了配股成本，却没把配股拿到的新股算进去。实测影响面：49,095 个抽样单元里 6 处
+    （0.012%）。修正走 `record_change` 留痕并重跑受影响的评价（见 `19` 号文档）。
     """
     base = row["close_t"]
-    return ((row["horizon_close"] * (1 + row.get("bonus", 0.0)) + row.get("dividend", 0.0)
-             - row.get("rights_cost", 0.0)) / base - 1) if base else 0.0
+    return ((row["horizon_close"] * (1 + row.get("bonus", 0.0) + row.get("rights", 0.0))
+             + row.get("dividend", 0.0) - row.get("rights_cost", 0.0)) / base - 1
+            ) if base else 0.0
 
 
 def _to_ms(date_str: str) -> int:
@@ -97,9 +105,10 @@ def _factor_value(row: dict, factor_id: str) -> float | None:
         base = row.get("close_60_ago")
         if not base or base <= 0:
             return None
-        # 总收益口径：窗口内除权除息已折算（见 repository.cross_section）
-        return ((row["close"] * (1 + row.get("bonus_60", 0.0)) + row.get("div_60", 0.0)
-                 - row.get("rights_cost_60", 0.0)) / base - 1)
+        # 总收益口径：窗口内除权除息已折算（见 repository.cross_section）。
+        # 配股比例同样要进乘数（2026-09-14 与 total_return 一并修正，此前漏掉）。
+        return ((row["close"] * (1 + row.get("bonus_60", 0.0) + row.get("rights_60", 0.0))
+                 + row.get("div_60", 0.0) - row.get("rights_cost_60", 0.0)) / base - 1)
     if factor_id == "bias_20":
         ma20 = row.get("ma20")
         if not ma20 or ma20 <= 0:

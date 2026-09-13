@@ -6,9 +6,10 @@ import duckdb
 from .schema import ADJUSTMENT_FACTOR_COLUMNS, DAILY_COLUMNS, FROZEN_READONLY_DATASETS
 
 #: 事件研究**预计算面板**的版本号。改了下面的 SQL 就要改它——否则旧缓存会被当成新口径用。
+#: v4：`forward_return` 把**配股比例**加回乘数，与修正后的 `service.total_return` 一致。
 #: v3：补一条有界修正语句，重算"最近 20 根 K 线跨度超过回溯上限"的行（长期停牌复牌股）。
 #: v2：`forward_return` 改为复刻 `service.total_return` 的既有口径（配股只减成本、不进乘数）。
-PANEL_SCHEMA_VERSION = "event_panel_v3"
+PANEL_SCHEMA_VERSION = "event_panel_v4"
 PANEL_FILENAME = "finsight_event_panel.duckdb"
 
 #: 快照列的回溯上限（**自然日**），必须等于 `cross_section(history_days=...)` 的默认值。
@@ -98,8 +99,11 @@ SELECT thscode, date_ms,
        sum(s_rights) OVER w_co + sum(o_rights) OVER w_off AS fwd_rights,
        sum(s_cost) OVER w_co + sum(o_cost) OVER w_off AS fwd_cost,
        CASE WHEN lead(close_price, 20) OVER w > 0 THEN
+            -- 与 `screener.service.total_return` **逐字一致**：配股比例进乘数
+            -- （2026-09-14 修正；此前面板复刻的是漏掉配股的旧口径，见 `19` 号文档）
             (lead(close_price, 20) OVER w
-             * (1 + (sum(s_bonus) OVER w_co + sum(o_bonus) OVER w_off))
+             * (1 + (sum(s_bonus) OVER w_co + sum(o_bonus) OVER w_off)
+                  + (sum(s_rights) OVER w_co + sum(o_rights) OVER w_off))
              + (sum(s_div) OVER w_co + sum(o_div) OVER w_off)
              - (sum(s_cost) OVER w_co + sum(o_cost) OVER w_off))
             / close_price - 1 ELSE NULL END AS forward_return
