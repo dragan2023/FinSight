@@ -1,8 +1,151 @@
 """Fixed DuckDB schema and queries; no caller-supplied SQL."""
 from __future__ import annotations
+from datetime import datetime, timezone
 from pathlib import Path
 import duckdb
 from .schema import ADJUSTMENT_FACTOR_COLUMNS, DAILY_COLUMNS, FROZEN_READONLY_DATASETS
+
+#: 事件研究**预计算面板**的版本号。改了下面的 SQL 就要改它——否则旧缓存会被当成新口径用。
+#: v3：补一条有界修正语句，重算"最近 20 根 K 线跨度超过回溯上限"的行（长期停牌复牌股）。
+#: v2：`forward_return` 改为复刻 `service.total_return` 的既有口径（配股只减成本、不进乘数）。
+PANEL_SCHEMA_VERSION = "event_panel_v3"
+PANEL_FILENAME = "finsight_event_panel.duckdb"
+
+#: 快照列的回溯上限（**自然日**），必须等于 `cross_section(history_days=...)` 的默认值。
+#: 长期停牌股复牌后，它的第 20/60 根 K 线可能落在 400 天之前——`cross_section` 那时给
+#: NULL（或只平均窗口内的少数几根），面板必须**复刻**这个行为才算等价。
+#: 有测试断言这两个常量一致，防止有人改了 `cross_section` 的默认值而忘了这里。
+SNAPSHOT_HISTORY_DAYS = 400
+
+#: 面板构建 SQL（**一次全表扫描**算出所有评估日所需的全部输入）。
+#:
+#: 事件研究原本每个评估日要跑两次全表查询（横截面 + 前向收益），1033 个评估日就是
+#: 2000+ 次全表扫描；这里改成**一遍**把它们物化下来。
+#:
+#: 与既有实现**逐位等价**的三处细节（都是实测踩出来的）：
+#:
+#: 1. **序列只由 `close_price > 0` 的 K 线构成**——`cross_section` 与 `settlement_returns`
+#:    都按这个口径排名（停牌/异常收盘不算一个"交易日"）；
+#: 2. **公司行动按时间戳区间 `(T, T+h]` 计入**：57,116 条除权记录里有 **274 条**落在
+#:    个股 K 线范围内却没有当天的 K 线（休市或停牌）。这批动作的窗口边界与"正好落在
+#:    K 线日"的那批**差一格**，所以分两股取窗口再相加——只取一股会与 `settlement_returns`
+#:    不一致（实测 49,095 个抽样单元里有 6 个不符）；
+#: 3. **回溯上限 400 自然日**（见 `SNAPSHOT_HISTORY_DAYS`）：不复刻它，长期停牌股复牌后的
+#:    `turnover_20` / `close_20_ago` / `close_60_ago` 会与 `cross_section` 不一致
+#:    （实测 3 个标的值差到 91%）。
+#:
+#: ⚠️ 面板**刻意复刻既有口径，包括它的一个缺陷**——不许在"加速"这一轮里顺手改口径，
+#: 否则"新旧结果一致"这个验收条件就废了。已发现的缺陷：仓库里 P0-1 验证过的规范式子
+#: （`corporate_action_total_return_history`）是
+#: `(close × (1 + 送股 + 配股) + 分红 − 配股成本) / prev_close`——**配股在乘数里**；
+#: 而 `screener.service.total_return` 只写 `(1 + 送股)`，**漏掉配股比例**（其 docstring
+#: 却写着包含配股）。面板按既有口径实现，`fwd_rights` 仍算出来并保留但不进公式，
+#: 该缺陷另行登记修复（见 `18` 号文档）。
+PANEL_BUILD_SQL = """
+CREATE OR REPLACE TABLE event_panel AS
+WITH bars AS (
+    SELECT thscode, date_ms, close_price, turnover,
+           row_number() OVER (PARTITION BY thscode ORDER BY date_ms) AS rn
+    FROM market.daily_k WHERE close_price > 0
+),
+acts AS (
+    SELECT b.thscode, b.rn, (a.ex_date_ms = b.date_ms) AS exact,
+           sum(coalesce(a.per_share_bonus, 0)) AS bonus,
+           sum(coalesce(a.dividend_per_share, 0)) AS dividend,
+           sum(coalesce(a.allotment_ratio, 0)) AS rights,
+           sum(coalesce(a.allotment_ratio, 0) * coalesce(a.allotment_price, 0)) AS rights_cost
+    FROM market.adjustment_factors a
+    ASOF JOIN bars b ON a.thscode = b.thscode AND a.ex_date_ms >= b.date_ms
+    GROUP BY b.thscode, b.rn, exact
+),
+grid AS (
+    SELECT b.thscode, b.date_ms, b.close_price, b.turnover, b.rn,
+           coalesce(s.bonus, 0) AS s_bonus, coalesce(s.dividend, 0) AS s_div,
+           coalesce(s.rights, 0) AS s_rights, coalesce(s.rights_cost, 0) AS s_cost,
+           coalesce(o.bonus, 0) AS o_bonus, coalesce(o.dividend, 0) AS o_div,
+           coalesce(o.rights, 0) AS o_rights, coalesce(o.rights_cost, 0) AS o_cost
+    FROM bars b
+    LEFT JOIN acts s ON s.thscode = b.thscode AND s.rn = b.rn AND s.exact
+    LEFT JOIN acts o ON o.thscode = b.thscode AND o.rn = b.rn AND NOT o.exact
+),
+framed AS (
+    SELECT *,
+           max(date_ms) OVER w20 AS frame20_last,
+           max(date_ms) OVER w60 AS frame60_last
+    FROM grid
+    WINDOW w20 AS (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 19 PRECEDING AND CURRENT ROW),
+           w60 AS (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)
+),
+masked AS (
+    SELECT *,
+           CASE WHEN date_ms >= frame20_last - CAST({history_days} AS BIGINT) * 86400000
+                THEN turnover END AS t20,
+           CASE WHEN date_ms >= frame60_last - CAST({history_days} AS BIGINT) * 86400000
+                THEN turnover END AS t60
+    FROM framed
+)
+SELECT thscode, date_ms,
+       turnover AS turnover_today,
+       avg(t20) OVER w20 AS turnover_20,
+       CASE WHEN date_ms - lag(date_ms, 20) OVER w <= CAST({history_days} AS BIGINT) * 86400000
+            THEN lag(close_price, 20) OVER w END AS close_20_ago,
+       CASE WHEN date_ms - lag(date_ms, 60) OVER w <= CAST({history_days} AS BIGINT) * 86400000
+            THEN lag(close_price, 60) OVER w END AS close_60_ago,
+       lead(date_ms, 20) OVER w AS horizon_ms,
+       lead(close_price, 20) OVER w AS close_fwd,
+       sum(s_bonus) OVER w_co + sum(o_bonus) OVER w_off AS fwd_bonus,
+       sum(s_div) OVER w_co + sum(o_div) OVER w_off AS fwd_div,
+       sum(s_rights) OVER w_co + sum(o_rights) OVER w_off AS fwd_rights,
+       sum(s_cost) OVER w_co + sum(o_cost) OVER w_off AS fwd_cost,
+       CASE WHEN lead(close_price, 20) OVER w > 0 THEN
+            (lead(close_price, 20) OVER w
+             * (1 + (sum(s_bonus) OVER w_co + sum(o_bonus) OVER w_off))
+             + (sum(s_div) OVER w_co + sum(o_div) OVER w_off)
+             - (sum(s_cost) OVER w_co + sum(o_cost) OVER w_off))
+            / close_price - 1 ELSE NULL END AS forward_return
+FROM masked
+WINDOW w AS (PARTITION BY thscode ORDER BY rn),
+       w20 AS (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 19 PRECEDING AND CURRENT ROW),
+       w_co AS (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 1 FOLLOWING AND 20 FOLLOWING),
+       w_off AS (PARTITION BY thscode ORDER BY rn ROWS BETWEEN CURRENT ROW AND 19 FOLLOWING)
+"""
+
+
+#: 修正语句：把"最近 20 根 K 线跨度超过回溯上限"的少数行的 `turnover_20` 重算。
+#:
+#: 为什么需要它：`cross_section` 的 20 日平均是在**400 自然日窗口内**取的，而窗口函数
+#: 的 20 行帧只能按行数取。两者在"长期停牌后复牌"的标的上会分叉——这类标的的 20 根 K 线
+#: 跨度可能好几年，帧里会混进窗口外的行。用 `max(date_ms) OVER w20` 之类的办法**修不了**：
+#: 帧的末行就是当前行，所以 `date_ms >= frame_last - 400d` 恒真（实测踩过，掩码完全没生效）。
+#: 因此对这批稀有行（实测 5,246 个标的里只有个位数）改用一次**有界**的关联子查询重算，
+#: 语义与 `cross_section` 逐字一致。
+PANEL_FIX_SQL = """
+CREATE OR REPLACE TEMP TABLE _panel_wide_frames AS
+SELECT thscode, date_ms FROM (
+    SELECT thscode, date_ms,
+           lag(date_ms, 19) OVER (PARTITION BY thscode ORDER BY date_ms) AS date_19_back
+    FROM market.daily_k WHERE close_price > 0
+) t
+WHERE date_19_back IS NOT NULL
+  AND date_ms - date_19_back > CAST({history_days} AS BIGINT) * 86400000;
+
+UPDATE event_panel SET turnover_20 = (
+    SELECT avg(d.turnover) FROM market.daily_k d
+    WHERE d.thscode = event_panel.thscode AND d.close_price > 0
+      AND d.date_ms <= event_panel.date_ms
+      AND d.date_ms >= event_panel.date_ms - CAST({history_days} AS BIGINT) * 86400000)
+WHERE EXISTS (SELECT 1 FROM _panel_wide_frames f
+              WHERE f.thscode = event_panel.thscode AND f.date_ms = event_panel.date_ms);
+"""
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _fingerprint_text(fingerprint: dict) -> str:
+    """把指纹字典转成可比较的稳定字符串（键排序，避免顺序敏感）。"""
+    return ";".join(f"{key}={fingerprint[key]}" for key in sorted(fingerprint))
 
 
 class WarehouseRepository:
@@ -409,6 +552,155 @@ class WarehouseRepository:
                 "close_20_ago", "close_60_ago", "bonus_20", "div_20", "rights_20", "rights_cost_20",
                 "bonus_60", "div_60", "rights_60", "rights_cost_60", "event_rows")
         return [dict(zip(keys, row)) for row in rows]
+
+    # --- 事件研究预计算面板（缓存，加速用；**不改动行情仓库本身**）-------------
+    @property
+    def event_panel_path(self) -> Path:
+        """面板缓存文件。放在行情仓库同目录（`data/market/` 已在 .gitignore 里）。"""
+        return self.path.parent / PANEL_FILENAME
+
+    def source_fingerprint(self) -> dict:
+        """行情源指纹：行情或除权表一变，面板就必须重建。
+
+        只用几个便宜且足够敏感的计数/极值——目的是"过时缓存必须能被发现"，
+        不是为了做校验和（那需要全表哈希，代价比重建面板还高）。
+        """
+        if not self.path.exists():
+            return {}
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            row = db.execute("""
+                SELECT (SELECT count(*) FROM daily_k),
+                       (SELECT max(date_ms) FROM daily_k),
+                       (SELECT count(*) FROM adjustment_factors),
+                       (SELECT max(ex_date_ms) FROM adjustment_factors)""").fetchone()
+        except duckdb.CatalogException:
+            return {}
+        finally:
+            db.close()
+        return {"daily_k_rows": row[0], "daily_k_max_date": row[1],
+                "adjustment_rows": row[2], "adjustment_max_ex_date": row[3]}
+
+    def build_event_panel(self, *, horizon_days: int = 20, panel_path: Path | None = None,
+                          force: bool = False) -> dict:
+        """构建/刷新事件研究面板。**幂等**：版本与指纹都一致时直接返回。
+
+        只在 `horizon_days == 20` 时可用（前瞻期写死在 SQL 里）；换期要另建面板——
+        这里显式拒绝，而不是悄悄给错数据。
+        """
+        if horizon_days != 20:
+            raise ValueError("面板只为 20 个交易日的前瞻期构建；换期需另建面板。")
+        target = Path(panel_path) if panel_path else self.event_panel_path
+        fingerprint = self.source_fingerprint()
+        if not fingerprint:
+            raise ValueError("行情仓库不存在或为空，无法构建面板。")
+        if not force and target.exists():
+            meta = self.event_panel_meta(panel_path=target)
+            if (meta.get("schema_version") == PANEL_SCHEMA_VERSION
+                    and meta.get("horizon_days") == "20"
+                    and meta.get("fingerprint") == _fingerprint_text(fingerprint)):
+                return {"rebuilt": False, "path": str(target), "meta": meta}
+        target.parent.mkdir(parents=True, exist_ok=True)
+        escaped = str(self.path).replace("'", "''")
+        db = duckdb.connect(str(target))
+        try:
+            db.execute("PRAGMA enable_progress_bar=false")
+            db.execute(f"ATTACH '{escaped}' AS market (READ_ONLY)")
+            db.execute("""CREATE TABLE IF NOT EXISTS event_panel_meta (
+                key VARCHAR PRIMARY KEY, value VARCHAR)""")
+            db.execute(PANEL_BUILD_SQL.format(history_days=SNAPSHOT_HISTORY_DAYS))
+            db.execute(PANEL_FIX_SQL.format(history_days=SNAPSHOT_HISTORY_DAYS))
+            db.execute("DELETE FROM event_panel_meta")
+            db.executemany("INSERT INTO event_panel_meta VALUES (?, ?)",
+                           [("schema_version", PANEL_SCHEMA_VERSION), ("horizon_days", "20"),
+                            ("fingerprint", _fingerprint_text(fingerprint)),
+                            ("source_path", str(self.path)), ("built_at", _now_iso())])
+            # `CREATE OR REPLACE` 会把旧表的数据块留在文件里（实测重建后文件翻倍：
+            # 383MB → 767MB）。CHECKPOINT 回收它们，否则每次重建都翻一倍。
+            db.execute("CHECKPOINT")
+            db.commit()
+        finally:
+            db.close()
+        return {"rebuilt": True, "path": str(target),
+                "meta": self.event_panel_meta(panel_path=target), "fingerprint": fingerprint}
+
+    def event_panel_meta(self, *, panel_path: Path | None = None) -> dict:
+        target = Path(panel_path) if panel_path else self.event_panel_path
+        if not target.exists():
+            return {}
+        db = duckdb.connect(str(target), read_only=True)
+        try:
+            rows = db.execute("SELECT key, value FROM event_panel_meta").fetchall()
+        except duckdb.CatalogException:
+            return {}
+        finally:
+            db.close()
+        return {key: value for key, value in rows}
+
+    def event_panel_status(self, *, panel_path: Path | None = None) -> dict:
+        """面板是否可用（存在 + 版本一致 + 指纹一致）。**不一致时必须重建**，不许带病使用。"""
+        target = Path(panel_path) if panel_path else self.event_panel_path
+        meta = self.event_panel_meta(panel_path=target)
+        current = self.source_fingerprint()
+        stale_reason = ""
+        if not meta:
+            stale_reason = "面板不存在"
+        elif meta.get("schema_version") != PANEL_SCHEMA_VERSION:
+            stale_reason = f"面板版本 {meta.get('schema_version')} != {PANEL_SCHEMA_VERSION}"
+        elif meta.get("fingerprint") != _fingerprint_text(current):
+            stale_reason = "行情源已变化（指纹不一致）"
+        return {"path": str(target), "ready": not stale_reason, "reason": stale_reason,
+                "meta": meta, "fingerprint": current}
+
+    def event_panel_window(self, *, start_ms: int | None = None, end_ms: int | None = None,
+                           dates: list[int] | None = None, chunk_dates: int = 40,
+                           panel_path: Path | None = None,
+                           panel_ready_checked: bool = False):
+        """按**日期分块**产出面板数据，避免把 1000 万行一次拉进内存。
+
+        产出 `(date_ms, {thscode: {...}})`。只在面板"就绪"时工作——过期面板宁可不跑，
+        也不能拿旧口径算出结论。
+
+        `dates` 给出时**只读这些日期**：涨停池只覆盖 1033 个交易日，而面板有 2427 个，
+        不限定就等于白读 58% 的行。
+        """
+        target = Path(panel_path) if panel_path else self.event_panel_path
+        if not panel_ready_checked:
+            status = self.event_panel_status(panel_path=target)
+            if not status["ready"]:
+                raise ValueError(f"事件研究面板不可用：{status['reason']}。"
+                                 f"先调用 build_event_panel()。")
+        db = duckdb.connect(str(target), read_only=True)
+        try:
+            if dates is not None:
+                wanted = sorted(dates)
+            else:
+                clauses, params = [], []
+                if start_ms is not None:
+                    clauses.append("date_ms >= ?")
+                    params.append(start_ms)
+                if end_ms is not None:
+                    clauses.append("date_ms <= ?")
+                    params.append(end_ms)
+                where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                wanted = [row[0] for row in db.execute(
+                    f"SELECT DISTINCT date_ms FROM event_panel {where} ORDER BY date_ms",
+                    params).fetchall()]
+            columns = ("thscode", "turnover_today", "turnover_20", "close_20_ago",
+                       "close_60_ago", "horizon_ms", "forward_return")
+            for start in range(0, len(wanted), chunk_dates):
+                chunk = wanted[start:start + chunk_dates]
+                marks = ",".join("?" for _ in chunk)
+                rows = db.execute(
+                    f"SELECT date_ms, {', '.join(columns)} FROM event_panel "
+                    f"WHERE date_ms IN ({marks}) ORDER BY date_ms, thscode", chunk).fetchall()
+                grouped: dict[int, dict[str, dict]] = {}
+                for row in rows:
+                    grouped.setdefault(row[0], {})[row[1]] = dict(zip(columns, row[1:]))
+                for date_ms in chunk:
+                    yield date_ms, grouped.get(date_ms, {})
+        finally:
+            db.close()
 
     # --- 涨跌停/炸板池 -------------------------------------------------------
     def write_limit_pool_day(self, *, date_ms: int, pool: str, rows: list[dict],

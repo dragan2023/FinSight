@@ -50,6 +50,13 @@ def main() -> int:
     parser.add_argument("--draws", type=int, default=200, help="安慰剂重抽次数")
     parser.add_argument("--family-prior-statistics", type=int, default=0,
                         help="同一族**此前已看过**的比较条数（A.2：多重检验计数必须含它）")
+    parser.add_argument("--source", default="panel", choices=("panel", "live"),
+                        help="数据通路：panel=预计算面板（快，默认）；live=逐日查库（慢，"
+                             "用于与面板做等价比对）")
+    parser.add_argument("--profile", action="store_true",
+                        help="打开诊断：每 25 个评估日打印墙钟增量与 Python 内存增量。"
+                             "⚠️ **tracemalloc 会追踪每一次分配，实测把 37 秒的跑变成 973 秒"
+                             "（26×）**——只看内存趋势时用，别拿它的墙钟当性能数字")
     parser.add_argument("--from", dest="from_text", default="", help="起始交易日 YYYY-MM-DD")
     parser.add_argument("--to", dest="to_text", default="", help="结束交易日 YYYY-MM-DD")
     parser.add_argument("--out", default="")
@@ -75,14 +82,31 @@ def main() -> int:
           "字段各自分组与重抽。千级交易日需要几十分钟。")
 
     started = time.time()
+    tracer = None
+    if args.profile:
+        import tracemalloc  # noqa: PLC0415
+
+        tracemalloc.start(5)
+        tracer = tracemalloc
+    checkpoint = {"time": started, "peak": 0}
 
     def progress(index: int, total: int, usable: dict) -> None:
         brief = "、".join(f"{key}:{value}" for key, value in usable.items())
-        print(f"  {index}/{total} 已处理，可用 {brief}（{time.time() - started:.0f}s）", flush=True)
+        now = time.time()
+        extra = f"（本次 {now - checkpoint['time']:.0f}s"
+        if tracer is not None:
+            current, peak = tracer.get_traced_memory()
+            checkpoint["peak"] = max(checkpoint["peak"], peak)
+            extra += f"，Python 内存 {current / 1048576:.0f}MB，峰值 {peak / 1048576:.0f}MB"
+        checkpoint["time"] = now
+        extra += "）"
+        print(f"  {index}/{total} 已处理，可用 {brief}（累计 {now - started:.0f}s）{extra}",
+              flush=True)
 
     reports = study.run_fields(fields=fields, start_ms=start_ms, end_ms=end_ms,
                                horizon_days=args.horizon, draws=args.draws, progress=progress,
-                               family_prior_statistics=args.family_prior_statistics)
+                               family_prior_statistics=args.family_prior_statistics,
+                               source=args.source)
     elapsed = time.time() - started
 
     out_dir = (Path(args.out) if args.out
@@ -94,6 +118,13 @@ def main() -> int:
         print(f"\n{'=' * 72}\n字段 {field}（{ALL_FIELDS[field]['name']}）"
               f"｜可用评估日 {report.get('dates_usable', 0)}/{report.get('dates_with_pool', 0)}"
               f"｜事件 {report.get('events_total', 0)} 个｜共用时 {elapsed:.0f}s")
+        path = report.get("data_path") or {}
+        print(f"数据通路：{path.get('source')}"
+              + (f"（{'本次新建面板' if path.get('rebuilt') else '命中面板缓存'}，"
+                 f"{path.get('schema_version')}）" if path.get("source") == "panel" else "")
+              + (f"｜回落原因：{path.get('reason')}" if path.get("reason") else ""))
+        if tracer is not None:
+            print(f"Python 内存峰值：{checkpoint['peak'] / 1048576:.0f}MB")
         if not report.get("results"):
             print(f"未能得出结论：{report.get('reason', '')}")
             exit_code = 1

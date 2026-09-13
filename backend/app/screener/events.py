@@ -254,16 +254,30 @@ class LimitUpEventStudy:
                        date_ms=date_ms, horizon_days=horizon_days)}
         if not cross or not outcome:
             return {}
-        turnover = {row["thscode"]: row["turnover_20"] for row in cross
+        snapshot = {row["thscode"]: row for row in cross}
+        return self._details(date_ms, pool, snapshot, outcome, horizon_days=horizon_days,
+                             fields=fields, draws=draws, rng=rng, pool_union=pool_union)
+
+    def _details(self, date_ms: int, pool: dict[str, dict], snapshot: dict[str, dict],
+                 outcome: dict[str, float], *, horizon_days: int, fields: tuple[str, ...],
+                 draws: int, rng: random.Random, pool_union: set[str]) -> dict[str, dict]:
+        """**单一实现**：给定当日的横截面快照与前向收益，算出全部字段 × 全部变体。
+
+        live 通路（逐日查库）与面板通路（预计算缓存）都调用它——**两条通路共用核心**，
+        才谈得上"切换前后结果一致"，也才有一处可写等价比对。
+        """
+        if not snapshot or not outcome:
+            return {}
+        turnover = {symbol: row.get("turnover_20") for symbol, row in snapshot.items()
                     if (row.get("turnover_20") or 0) > 0}
         if not turnover:
             return {}
         buckets = self._quantiles(turnover, DECILES)
         prior = {}
-        for row in cross:
+        for symbol, row in snapshot.items():
             value = self._prior_momentum(row)
             if value is not None:
-                prior[row["thscode"]] = value
+                prior[symbol] = value
         terciles = self._quantiles(prior, PRIOR_GROUPS)
 
         # 两套对照网格：粗（成交额十分位）与细（十分位 × 事前动量三分位）。
@@ -286,10 +300,9 @@ class LimitUpEventStudy:
             return {}
 
         details: dict[str, dict] = {}
-        cross_by_symbol = {row["thscode"]: row for row in cross}
         # 分层要用到**另一个字段**的中位数（例如"封单高"这一层）。原生字段与派生字段
-        # 都按同一套 `_field_values` 取，绝不两处各写一遍。
-        field_values = {name: self._field_values(name, pool, cross_by_symbol)
+        # 都按同一套 `_field_values` 取（派生字段要读当日横截面行），绝不两处各写一遍。
+        field_values = {name: self._field_values(name, pool, snapshot)
                         for name in ALL_FIELDS}
         medians = {name: (sorted(values.values())[len(values) // 2] if values else None)
                    for name, values in field_values.items()}
@@ -462,7 +475,7 @@ class LimitUpEventStudy:
 
     def _report(self, field: str, per_date: dict[int, dict], *, horizon_days: int,
                 draws: int, seed: int, dates_with_pool: int,
-                family_prior_statistics: int = 0) -> dict:
+                family_prior_statistics: int = 0, source_info: dict | None = None) -> dict:
         usable = sorted(per_date)
         names = sorted(per_date[usable[0]]["variants"]) if usable else []
         variants = {name: self._variant_report(field, per_date, usable, name, draws)
@@ -492,6 +505,9 @@ class LimitUpEventStudy:
         return {
             "field": field, "field_name": ALL_FIELDS[field]["name"],
             "groups": ALL_FIELDS[field]["groups"], "split": ALL_FIELDS[field]["split"],
+            # 数据通路必须随结果一起披露：面板与 live 已做过逐位等价比对（49,095 个单元
+            # 零差异），但读者仍需知道这份数字是从哪条通路来的。
+            "data_path": source_info or {"source": "live"},
             "horizon_days": horizon_days, "draws": draws,
             "dates_with_pool": dates_with_pool, "dates_usable": len(usable),
             "events_total": base.get("events", 0),
@@ -546,12 +562,59 @@ class LimitUpEventStudy:
             "disclaimer": "研究参考，不构成投资建议。",
         }
 
+    # --- 两条数据通路（共用 `_details`，因此可以逐位比对）--------------------
+    def _ensure_panel(self, *, horizon_days: int) -> dict:
+        """确保面板可用；过期就重建。**重建是安全的**——面板纯属派生物。"""
+        status = self._repository.event_panel_status()
+        if status["ready"]:
+            return {"path": status["path"], "rebuilt": False, "reason": "",
+                    "schema_version": status["meta"].get("schema_version")}
+        built = self._repository.build_event_panel(horizon_days=horizon_days)
+        return {"path": built["path"], "rebuilt": True, "reason": status["reason"],
+                "schema_version": built["meta"].get("schema_version")}
+
+    def _date_pairs(self, dates: list[int], by_date: dict[int, dict],
+                    *, start_ms: int | None, end_ms: int | None, source: str,
+                    horizon_days: int):
+        """产出 `(date_ms, snapshot, outcome)`。
+
+        - `panel`：一次性读出面板里**这些池内日期**的全部输入（不读无关日期）；
+        - `live`：逐日查库（慢，但用来证明面板等价）。
+        """
+        if source == "panel":
+            wanted = [date_ms for date_ms in dates
+                      if (start_ms is None or date_ms >= start_ms)
+                      and (end_ms is None or date_ms <= end_ms)]
+            for date_ms, panel_rows in self._repository.event_panel_window(
+                    dates=wanted, panel_ready_checked=True):
+                if not panel_rows:
+                    continue
+                outcome = {symbol: row["forward_return"]
+                           for symbol, row in panel_rows.items()
+                           if row["forward_return"] is not None}
+                yield date_ms, panel_rows, outcome
+            return
+        for date_ms in dates:
+            snapshot = {row["thscode"]: row
+                        for row in self._repository.cross_section(date_ms=date_ms)}
+            outcome = {row["thscode"]: total_return(row)
+                       for row in self._repository.settlement_returns(
+                           date_ms=date_ms, horizon_days=horizon_days)}
+            yield date_ms, snapshot, outcome
+
     # --- 主入口 -----------------------------------------------------------
     def run_fields(self, *, fields: tuple[str, ...], start_ms: int | None = None,
                    end_ms: int | None = None, horizon_days: int = 20, draws: int = 200,
                    seed: int = 20260913, progress=None,
-                   family_prior_statistics: int = 0) -> dict[str, dict]:
-        """**一次遍历**算出多个字段的全部变体：取数只做一遍，字段与变体各自分组与重抽。"""
+                   family_prior_statistics: int = 0, source: str = "panel") -> dict[str, dict]:
+        """**一次遍历**算出多个字段的全部变体：取数只做一遍，字段与变体各自分组与重抽。
+
+        `source`：
+        - `"panel"`（默认）：用**预计算面板**（一次全表扫描物化全部评估日的输入）。
+          过期面板会被拒绝并自动重建（面板是派生物，重建永远正确）。
+        - `"live"`：逐日调用 `cross_section` + `settlement_returns`。慢得多（每个评估日
+          两次全表扫描），保留它是为了**与面板做等价比对**——两条通路共用 `_details`。
+        """
         unknown = [item for item in fields if item not in ALL_FIELDS]
         if unknown:
             raise ValueError(f"不支持的事件研究字段：{unknown}（可选 {list(ALL_FIELDS)}）")
@@ -559,6 +622,8 @@ class LimitUpEventStudy:
             raise ValueError("至少要指定一个字段。")
         if draws < 1 or not 1 <= horizon_days <= 250:
             raise ValueError("重抽次数必须为正、前瞻期需在 1–250 个交易日之间。")
+        if source not in ("panel", "live"):
+            raise ValueError(f"source 只能是 panel 或 live，收到 {source!r}")
 
         rows = self._repository.limit_pool_rows(pool="limit_up", start_ms=start_ms,
                                                 end_ms=end_ms)
@@ -573,11 +638,24 @@ class LimitUpEventStudy:
         pool_union = {symbol for items in by_date.values() for symbol in items}
         rng = random.Random(f"{'+'.join(fields)}:{seed}")
 
+        panel_info: dict = {"source": source}
+        if source == "panel" and horizon_days != 20:
+            # 面板把 20 日前瞻期写死在 SQL 里；其它前瞻期回落逐日查库，
+            # 并**在报告里写明回落原因**，不许悄悄换通路。
+            panel_info = {"source": "live",
+                          "reason": f"面板只支持 20 日前瞻期，本次为 {horizon_days} 日 → 回落逐日查库"}
+            source = "live"
+        if source == "panel":
+            panel_info = self._ensure_panel(horizon_days=horizon_days)
+            panel_info["source"] = "panel"
+
         per_field: dict[str, dict[int, dict]] = {field: {} for field in fields}
-        for index, date_ms in enumerate(dates, 1):
-            details = self._study_date(date_ms, by_date[date_ms], horizon_days=horizon_days,
-                                       fields=fields, draws=draws, rng=rng,
-                                       pool_union=pool_union)
+        pairs = self._date_pairs(dates, by_date, start_ms=start_ms, end_ms=end_ms,
+                                 source=source, horizon_days=horizon_days)
+        for index, (date_ms, snapshot, outcome) in enumerate(pairs, 1):
+            details = self._details(date_ms, by_date[date_ms], snapshot, outcome,
+                                    horizon_days=horizon_days, fields=fields, draws=draws,
+                                    rng=rng, pool_union=pool_union)
             for field, detail in details.items():
                 if detail["events_used"]:
                     per_field[field][date_ms] = detail
@@ -594,13 +672,15 @@ class LimitUpEventStudy:
                 continue
             reports[field] = self._report(field, per_field[field], horizon_days=horizon_days,
                                           draws=draws, seed=seed, dates_with_pool=len(dates),
-                                          family_prior_statistics=family_prior_statistics)
+                                          family_prior_statistics=family_prior_statistics,
+                                          source_info=panel_info)
         return reports
 
     def run(self, *, start_ms: int | None = None, end_ms: int | None = None,
             horizon_days: int = 20, field: str = "continue_day_cnt",
-            draws: int = 200, seed: int = 20260913, progress=None) -> dict:
+            draws: int = 200, seed: int = 20260913, progress=None,
+            source: str = "panel") -> dict:
         """单字段入口（返回结构保持 `results` = base_all，向后兼容）。"""
         return self.run_fields(fields=(field,), start_ms=start_ms, end_ms=end_ms,
                                horizon_days=horizon_days, draws=draws, seed=seed,
-                               progress=progress)[field]
+                               progress=progress, source=source)[field]

@@ -20,18 +20,19 @@ from backend.app.market_warehouse.repository import WarehouseRepository
 from backend.app.screener.events import FIELD_ENCODINGS, LimitUpEventStudy, _t_stat
 
 DAY_MS = 86_400_000
-#: 事件日排在第 70 根 K 线：**事前 40 日动量需要 `close_60_ago`（第 61 根）**，
-#: 事件日必须晚于它，否则"事前特征匹配"变体会静默退化成 base（早期夹具就是这样）。
-EVENT_DAY = DAY_MS * 70
+#: 事件日排在第 75 根 K 线：既要**事前 40 日动量**（需第 61 根），
+#: 又要**20 日前瞻窗口**（需第 95 根）——面板只支持 20 日前瞻期，
+#: 夹具必须够长才能做"面板 vs 逐日查库"的等价比对。
+EVENT_DAY = DAY_MS * 75
 SYMBOLS = [f"{index:06d}.SZ" for index in range(30)]
 #: 涨停的 6 只**故意分散在不同成交额十分位**（对照必须落在同一十分位；若全落在最低那一档，
 #: 该档里没有非涨停标的，事件会被如实跳过 → 一天都用不了）。
 POOL = [SYMBOLS[index] for index in (1, 6, 11, 16, 21, 26)]
 CONTINUE_DAYS = [1, 1, 1, 2, 2, 3]
 SEAL_MONEY = [1.0e6, 2.0e6, 3.0e6, 4.0e6, 5.0e6, 6.0e6]
-#: 30 只 × 80 根 = 2400 行。**不能再多**：实测本机 DuckDB 参数化插入约 2–7 毫秒/行。
-#: 80 根是**事前特征匹配的下限**：`close_60_ago` 需要第 61 根，事件日必须排在它之后。
-BARS = 80
+#: 30 只 × 100 根 = 3000 行。**不能再多**：实测本机 DuckDB 参数化插入约 2–7 毫秒/行，
+#: 夹具大一倍就慢一倍（因此这个文件用模块级夹具，只建一次）。
+BARS = 100
 
 
 def _fixture(repository) -> None:
@@ -343,6 +344,76 @@ def test_family_threshold_is_wider_than_this_rounds_threshold(repository):
     assert family["family_total_statistics"] == family["statistics_tested"] + 20
     assert family["bonferroni_family_abs_t"] > family["bonferroni_all_abs_t"]
     assert plain["bonferroni_all_abs_t"] == family["bonferroni_all_abs_t"]
+
+
+# --- 数据通路：面板 vs 逐日查库（**加速不能改结果**的守卫）-----------------
+
+def _canonical(value):
+    """把 NaN 归一成哨兵再比较。
+
+    `float("nan") != float("nan")`，所以直接比字典会把"两边都算不出来"误报成不一致。
+    归一之后，任何**真实**差异仍然会被抓到。
+    """
+    if isinstance(value, float) and value != value:
+        return "__nan__"
+    if isinstance(value, dict):
+        return {key: _canonical(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_canonical(item) for item in value]
+    return value
+
+
+def test_panel_and_live_paths_produce_identical_results(repository):
+    """两条通路必须**逐位一致**。
+
+    面板把"每个评估日两次全表扫描"换成"一次全表扫描物化"，是纯性能改造；
+    只要结果有任何一处不同，这次改造就不合格。这条测试是那个承诺的守卫。
+    """
+    study = LimitUpEventStudy(repository)
+    live = study.run(field="seal_ratio", horizon_days=20, draws=5, source="live")
+    panel = study.run(field="seal_ratio", horizon_days=20, draws=5, source="panel")
+
+    assert live["data_path"]["source"] == "live"
+    assert panel["data_path"]["source"] == "panel"
+    assert "rebuilt" in panel["data_path"]
+    for key in ("dates_with_pool", "dates_usable", "events_total", "results", "variants",
+                "by_period", "multiplicity"):
+        left, right = _canonical(live[key]), _canonical(panel[key])
+        assert left == right, f"{key} 不一致：面板会改变结论，不可接受"
+
+
+def test_panel_is_reused_and_rebuilt_only_when_the_source_changes(repository):
+    """面板是缓存：同源同版本命中缓存；行情源一变（指纹不同）就必须重建。"""
+    study = LimitUpEventStudy(repository)
+    repository.build_event_panel(force=True)              # 与测试执行顺序解耦
+    assert study.run(field="seal_ratio", horizon_days=20,
+                     draws=3)["data_path"]["rebuilt"] is False, "同源同版本必须命中缓存"
+
+    # 往行情里补一根 K 线 → 指纹变化 → 必须判定过期
+    db = repository._connect()
+    try:
+        db.execute("INSERT INTO daily_k VALUES (?,?,?,?,?,?,?,?,?,?)",
+                   ("000001.SZ", DAY_MS * (BARS + 1), 10.0, 10.1, 9.9, 10.0, 1e6, 1e7,
+                    "none", "CNY"))
+        db.commit()
+    finally:
+        db.close()
+    status = repository.event_panel_status()
+    assert status["ready"] is False and "行情源已变化" in status["reason"]
+    assert study.run(field="seal_ratio", horizon_days=20,
+                     draws=3)["data_path"]["rebuilt"] is True, "指纹变了必须重建"
+
+
+def test_other_horizons_fall_back_to_live_and_say_so(repository):
+    """面板只支持 20 日前瞻期；其它期必须**回落并写明原因**，不许悄悄换通路。"""
+    report = LimitUpEventStudy(repository).run(field="seal_ratio", horizon_days=5, draws=3)
+    assert report["data_path"]["source"] == "live"
+    assert "20 日" in report["data_path"]["reason"]
+
+
+def test_panel_build_refuses_other_horizons(repository):
+    with pytest.raises(ValueError):
+        repository.build_event_panel(horizon_days=10)
 
 
 # --- 报告纪律 --------------------------------------------------------------
