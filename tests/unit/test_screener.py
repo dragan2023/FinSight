@@ -16,7 +16,9 @@ from backend.app.market_warehouse.repository import WarehouseRepository
 from backend.app.screener import FACTOR_IDS, ScreenerService, UniverseRules
 from backend.app.screener.service import (_stdev, _verdict, ascending_ranks,
                                           percentile_preference)
-from backend.app.screener.universe import UNSUPPORTED_EXCLUSIONS, apply_rules
+from backend.app.screener.universe import (BASIS_LIMIT_UP_PROXY, BASIS_REAL_LIMIT_UP_POOL,
+                                           UNSUPPORTED_EXCLUSIONS, apply_rules,
+                                           limit_up_evidence)
 
 DAY_MS = 86_400_000
 THSCODE = "601799.SH"
@@ -89,6 +91,124 @@ def test_limit_up_proxy_can_be_disabled_and_is_documented_as_a_proxy():
     assert len(kept) == 1 and exclusions["suspected_limit_up"] == 0
     _, excluded = apply_rules(rows, UniverseRules())
     assert excluded["suspected_limit_up"] == 1
+
+
+# --- 涨停剔除：真实池优先 + 代理回落必须带理由 -------------------------------
+# 规则在 2026-09-13 变更过一次：原来只有 9.8% 价量代理，现在优先用同花顺涨停池。
+# 下面几条把"口径必须标注、回落必须带理由、口径必须进 params_hash"钉住。
+
+def test_real_pool_is_authoritative_and_proxy_only_names_are_kept():
+    """真实池说不是涨停，代理说是——**以真实池为准**（保留），并把分歧记下来。"""
+    rows = [_row(thscode="000001.SZ", close=11.0, high=11.0, prev_close=10.0)]  # 代理说涨停
+    diagnostics: dict = {}
+    evidence = limit_up_evidence(DAY_MS, codes=["000009.SZ"], rules=UniverseRules(),
+                                 sync_status="ok", reason="本地涨停池")
+    kept, exclusions = apply_rules(rows, UniverseRules(), limit_up=evidence,
+                                   diagnostics=diagnostics)
+
+    assert [row["thscode"] for row in kept] == ["000001.SZ"], "代理误判不得剔除"
+    assert exclusions["suspected_limit_up"] == 0 and exclusions["confirmed_limit_up"] == 0
+    assert diagnostics["basis"] == BASIS_REAL_LIMIT_UP_POOL
+    assert diagnostics["proxy_only"] == 1 and diagnostics["proxy_hits"] == 1
+
+
+def test_real_pool_catches_an_st_five_percent_limit_up_that_the_proxy_misses():
+    """ST 涨停是 5%，代理按 9.8% 判定必然漏掉——这是真实池唯一无法被代理替代的地方。"""
+    rows = [_row(thscode="600001.SH", close=10.5, prev_close=10.0, high=10.5)]  # 涨幅 5%
+    diagnostics: dict = {}
+    evidence = limit_up_evidence(DAY_MS, codes=["600001.SH"], rules=UniverseRules(),
+                                 sync_status="ok")
+    kept, exclusions = apply_rules(rows, UniverseRules(), limit_up=evidence,
+                                   diagnostics=diagnostics)
+
+    assert kept == []
+    assert exclusions["confirmed_limit_up"] == 1 and exclusions["suspected_limit_up"] == 0
+    assert diagnostics["pool_only"] == 1, "池子抓到、代理漏掉的那只必须被计数"
+
+
+def test_falling_back_to_the_proxy_never_happens_silently():
+    """没有真实池时必须回落到代理，且**必须给出理由**——不允许静默降级。"""
+    evidence = limit_up_evidence(DAY_MS, codes=None, rules=UniverseRules(),
+                                 sync_status="api_error", reason="台账 status=api_error（code=1002）")
+    assert evidence.basis == BASIS_LIMIT_UP_PROXY and evidence.codes is None
+    assert "1002" in evidence.reason
+
+    diagnostics: dict = {}
+    apply_rules([_row(close=11.0, high=11.0, prev_close=10.0)], UniverseRules(),
+                limit_up=evidence, diagnostics=diagnostics)
+    assert diagnostics["basis"] == BASIS_LIMIT_UP_PROXY
+    assert diagnostics["reason"], "回落理由不得为空"
+    # 连证据都不传时，也必须说明是代理口径而不是"用了真实池"
+    bare: dict = {}
+    _, exclusions = apply_rules([_row(close=11.0, high=11.0, prev_close=10.0)],
+                                UniverseRules(), diagnostics=bare)
+    assert bare["basis"] == BASIS_LIMIT_UP_PROXY and exclusions["suspected_limit_up"] == 1
+
+
+def test_proxy_only_source_is_explicitly_labelled_as_a_contrast_basis():
+    """`proxy_only` 只用于度量规则变更的影响，输出里必须写明它是刻意的对照口径。"""
+    rules = UniverseRules(limit_up_source="proxy_only")
+    evidence = limit_up_evidence(DAY_MS, codes=["600001.SH"], rules=rules)
+    assert evidence.basis == BASIS_LIMIT_UP_PROXY and evidence.codes is None
+    assert "proxy_only" in evidence.reason and "对照口径" in evidence.reason
+    assert rules.as_dict()["limit_up_source"] == "proxy_only"
+
+
+def test_unknown_limit_up_source_is_rejected():
+    with pytest.raises(ValueError):
+        UniverseRules(limit_up_source="whatever")
+
+
+def test_limit_up_basis_enters_the_params_hash(tmp_path):
+    """同一个评估日，"真实池剔除"与"代理剔除"是两个不同规则，**不得**共用一个 params_hash。"""
+    repository = WarehouseRepository(tmp_path / "market.duckdb")
+    _write_fixture(repository)
+    repository.write_limit_pool_day(
+        date_ms=DAY_MS * 80, pool="limit_up", rows=[{"thscode": "000001.SZ", "is_st": "0"}],
+        status="ok", total=1, pages=1, page_size=200, error_code=0, error_message=None,
+        fetched_at="2026-09-13T00:00:00+00:00")
+    service = ScreenerService(repository)
+    rules = UniverseRules(min_history_bars=60)
+
+    real = service.rank(DAY_MS * 80, rules=rules, top_n=None)
+    contrast = service.rank(DAY_MS * 80, rules=UniverseRules(min_history_bars=60,
+                                                             limit_up_source="proxy_only"),
+                            top_n=None)
+
+    assert real["universe"]["limit_up"]["basis"] == BASIS_REAL_LIMIT_UP_POOL
+    assert contrast["universe"]["limit_up"]["basis"] == BASIS_LIMIT_UP_PROXY
+    assert real["params_hash"] != contrast["params_hash"], "口径变化必须改变 params_hash"
+
+
+def test_ok_empty_ledger_is_not_read_as_no_limit_up(tmp_path):
+    """`ok_empty` 可能是"超出可回溯范围"，也可能是"当天真的没有"——两者必须在输出里可区分。"""
+    repository = WarehouseRepository(tmp_path / "market.duckdb")
+    _write_fixture(repository)
+    repository.write_limit_pool_day(
+        date_ms=DAY_MS * 80, pool="limit_up", rows=[], status="ok_empty", total=None,
+        pages=None, page_size=200, error_code=0, error_message=None,
+        fetched_at="2026-09-13T00:00:00+00:00")
+    evidence = ScreenerService(repository)._limit_up_evidence(DAY_MS * 80, UniverseRules())
+
+    assert evidence.basis == BASIS_LIMIT_UP_PROXY and evidence.codes is None
+    assert "ok_empty" in evidence.reason and "不能" in evidence.reason
+
+
+def test_ic_report_declares_which_limit_up_basis_it_used(tmp_path):
+    """IC 报告必须报出口径覆盖，否则读者会以为结论已建立在交易所口径之上。"""
+    repository = WarehouseRepository(tmp_path / "market.duckdb")
+    _write_fixture(repository)
+    service = ScreenerService(repository)
+
+    single = service.ic_for_date(DAY_MS * 80, rules=UniverseRules(min_history_bars=60),
+                                 factor_ids=("bias_20",), draws=5)
+    assert single["limit_up"]["basis"] == BASIS_LIMIT_UP_PROXY   # 无池子 → 回落口径
+
+    report = service.ic_report([DAY_MS * 80], rules=UniverseRules(min_history_bars=60),
+                               factor_ids=("bias_20",), draws=5)
+    assert report["limit_up_basis_by_date"] == {BASIS_LIMIT_UP_PROXY: 1}
+    assert "不得" in report["limit_up_note"] and "口径" in report["limit_up_note"]
+
 
 
 # --- 因子口径 -------------------------------------------------------------
@@ -236,3 +356,27 @@ def test_ic_report_does_not_expose_a_placebo_based_pass_rate():
     # 方法说明必须写明安慰剂只是机制自检
     assert "机制自检" in text and "不得**用作显著性门槛" in text.replace("**", "**")
     assert json  # 保持 import 有用（避免 lint 误报）
+
+
+def test_pool_derived_fields_stay_out_of_the_cross_sectional_factor_set():
+    """涨停池字段（连板/封单/涨停原因）**只在池内有定义**，池外是"未定义"而不是缺失。
+
+    把它们塞进横截面因子集，等于把"选择集"当成数值——算出来的 IC 无法解释。
+    它们的合法用途是事件研究，且已作为独立设计登记进预注册台账
+    （`scripts/governance_register_limit_up_fields.py`）。这条测试防止有人图省事把它们加回来。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    factors_source = (root / "backend" / "app" / "screener" / "factors.py").read_text(
+        encoding="utf-8")
+    for field in ("continue_day_cnt", "seal_money", "limit_up_reason"):
+        assert field not in FACTOR_IDS
+        assert field not in factors_source, f"{field} 不得进入横截面因子集"
+
+    script = (root / "scripts" / "governance_register_limit_up_fields.py").read_text(
+        encoding="utf-8")
+    # 预注册里必须写明样本域、对照、以及"尚未评价"
+    assert "eligible_domain" in script and "control" in script
+    assert "尚未评价" in script
+    assert "对照置换" in script, "安慰剂设计必须在预注册时就声明（D19）"

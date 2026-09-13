@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -100,18 +101,43 @@ class LimitPoolSync:
                 "error_message": error_message}
 
     async def sync_dates(self, http: httpx.AsyncClient, dates: list[int], pools: list[str],
-                         *, page_size: int = MAX_PAGE_SIZE, progress=None) -> dict:
+                         *, page_size: int = MAX_PAGE_SIZE, progress=None,
+                         already: set[tuple[int, str]] | None = None,
+                         sleep_seconds: float = 0.0) -> dict:
+        """逐日逐池同步。
+
+        `already` 是"台账里已有记录"的 `(date_ms, pool)` 集合——深回补（涨停池到 2022 约
+        1130 次请求）必须能**断点续跑**，否则中途断了就要从头再发一遍请求。跳过的组合
+        以 `status="skipped"` 计入汇总（如实计数，不假装"同步过"）。
+        """
         results = []
         for index, date_ms in enumerate(dates, 1):
             for pool in pools:
-                results.append(await self.sync_day(http, date_ms, pool, page_size=page_size))
+                if already and (date_ms, pool) in already:
+                    results.append({"date_ms": date_ms, "pool": pool, "status": "skipped",
+                                    "fetched": 0, "total": None, "pages": None,
+                                    "error_code": None, "error_message": None})
+                else:
+                    results.append(await self.sync_day(http, date_ms, pool, page_size=page_size))
+                    if sleep_seconds > 0:
+                        # 礼貌性间隔：同一 host 连续请求，避免触发限流。
+                        await asyncio.sleep(sleep_seconds)
             if progress is not None:
                 progress(index, len(dates), results[-len(pools):])
         return self.summarize(results)
 
+    def synced_keys(self, pool: str | None = None) -> set[tuple[int, str]]:
+        """台账里**已有记录**的 `(date_ms, pool)`：供 `--skip-synced` 断点续跑使用。
+
+        只认"发过请求并且落进了台账"的事实，**不区分成功失败**：失败的那天要重试请用
+        `--refresh`（失败记录本身是有价值的证据，不能被静默覆盖掉）。"""
+        return {(item["date_ms"], item["pool"])
+                for item in self._repository.limit_pool_sync_days(pool=pool)}
+
     @staticmethod
     def summarize(results: list[dict]) -> dict:
-        """按状态汇总。**逐字区分** ok / ok_empty / api_error / transport_error / page_limit。"""
+        """按状态汇总。**逐字区分** ok / ok_empty / api_error / transport_error / page_limit /
+        skipped（断点续跑时跳过的、台账里已有记录的组合）。"""
         summary: dict[str, int] = {}
         days_with_data = 0
         for item in results:

@@ -205,3 +205,62 @@ async def test_pagination_stops_on_a_short_page(repository):
     http = _StubHttp([_page([_item(THSCODE)] * 1, total=1, pages=1)])
     result = await _sync(repository).sync_day(http, DAY_MS, "limit_up", page_size=200)
     assert len(http.calls) == 1 and result["pages"] == 1
+
+
+# --- 5) 深回补必须可断点续跑 ------------------------------------------------
+# 实测规模：涨停池回补到 2022 是 1133 个交易日 = 1133 次请求，要跑十几分钟。
+# 中途断掉后重跑若把已取过的日子**再发一遍**，既浪费配额也不礼貌（同花顺免费但限流）。
+
+async def test_skip_synced_does_not_re_request_days_already_in_the_ledger(repository):
+    sync = _sync(repository)
+    await sync.sync_day(_StubHttp([_page([_item(THSCODE)], total=1, pages=1)]), DAY_MS, "limit_up")
+
+    assert (DAY_MS, "limit_up") in sync.synced_keys()
+    resume_http = _StubHttp()
+    summary = await sync.sync_dates(resume_http, [DAY_MS], ["limit_up"],
+                                    already=sync.synced_keys())
+
+    assert resume_http.calls == [], "台账里已有的组合不得再发请求"
+    assert summary["by_status"] == {"skipped": 1}, "跳过要如实计数，不假装同步过"
+    assert summary["rows"] == 0
+
+
+async def test_skip_synced_is_per_pool_not_per_day(repository):
+    """涨停池已同步不代表跌停池也已同步——跳过必须按 (日期, 池子) 组合判断。"""
+    sync = _sync(repository)
+    await sync.sync_day(_StubHttp([_page([_item(THSCODE)], total=1, pages=1)]), DAY_MS, "limit_up")
+
+    http = _StubHttp([_page([_item(THSCODE)], total=1, pages=1)])
+    summary = await sync.sync_dates(http, [DAY_MS], ["limit_up", "limit_down"],
+                                    already=sync.synced_keys())
+
+    assert [call["url"].rsplit("/", 1)[-1] for call in http.calls] == ["limit-down-pool"]
+    assert summary["by_status"] == {"skipped": 1, "ok": 1}
+
+
+async def test_failed_days_stay_in_the_ledger_and_are_retried_when_not_skipped(repository):
+    """失败是有价值的证据，不能被静默覆盖；要重试就显式去掉 --skip-synced。"""
+    sync = _sync(repository)
+    await sync.sync_day(_StubHttp([{"code": 1002, "message": "out of range"}]), DAY_MS, "limit_down")
+    assert repository.limit_pool_sync_days(pool="limit_down")[0]["status"] == "api_error"
+
+    http = _StubHttp([_page([_item("000001.SZ", is_st=True)], total=1, pages=1)])
+    await sync.sync_day(http, DAY_MS, "limit_down")
+
+    assert repository.limit_pool_sync_days(pool="limit_down")[0]["status"] == "ok"
+    assert repository.limit_pool_rows(pool="limit_down", date_ms=DAY_MS)[0]["is_st"]
+
+
+async def test_sleep_between_requests_is_applied(repository, monkeypatch):
+    """礼貌性间隔：深回补时不得无间隔地连续打请求。"""
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr("backend.app.market_warehouse.limit_pools.asyncio.sleep", fake_sleep)
+    http = _StubHttp([_page([_item(THSCODE)], total=1, pages=1), _page([_item(THSCODE)], total=1, pages=1)])
+    await _sync(repository).sync_dates(http, [DAY_MS, DAY_MS + 86_400_000], ["limit_up"],
+                                       sleep_seconds=0.2)
+
+    assert slept == [0.2, 0.2]

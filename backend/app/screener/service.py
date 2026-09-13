@@ -22,7 +22,9 @@ from datetime import datetime, timedelta, timezone
 
 from ..errors import AppError
 from .factors import FACTOR_BY_ID, FACTOR_IDS, FACTOR_SET_VERSION, LIQUIDITY_COLUMN
-from .universe import RULE_NOTES, UNSUPPORTED_EXCLUSIONS, UniverseRules, apply_rules
+from .universe import (BASIS_LIMIT_UP_PROXY, BASIS_REAL_LIMIT_UP_POOL, LimitUpEvidence,
+                       RULE_NOTES, UNSUPPORTED_EXCLUSIONS, UniverseRules, apply_rules,
+                       limit_up_evidence)
 
 CST = timezone(timedelta(hours=8))
 
@@ -31,8 +33,11 @@ PLACEBO_DRAWS = 200
 
 LIMITATIONS = [
     "本机行情仓库不含退市证券，历史统计存在乐观偏置（幸存者偏差）。",
-    "无法剔除 ST / *ST：本地数据没有 is_st 字段。",
-    "涨跌停与停牌只用了价量代理指标，与交易所口径不同。",
+    "无法剔除 ST / *ST：本地数据没有 is_st 字段（涨停池里的 is_st 只覆盖涨停当天，"
+    "且手册写明『仅展示，不作为筛选入参』）。",
+    "**涨停**剔除自 2026-09-13 起优先用同花顺涨停池（交易所口径，覆盖已同步的交易日），"
+    "未同步的评估日回落到价量代理；**跌停、炸板、停牌**仍只有代理指标。"
+    "每个评估日实际用的是哪一种，写在 `universe.limit_up.basis` 里。",
     "因子只用「量价 + 流动性」：财务因子算不出来（缺 Z-Score 与 ROA 所需字段）。",
     "横截面 IC 只说明**同期**的相对关系，不构成任何个股推荐；本模块不产出买入清单。",
 ]
@@ -134,6 +139,39 @@ class ScreenerService:
     def __init__(self, repository) -> None:
         self._repository = repository
 
+    # --- 涨停剔除口径（真实池优先 / 代理回落）-------------------------------
+    def _ledger(self) -> dict[int, dict]:
+        """涨停池取数台账，按评估日索引。**只看已落库的取数记录，不联网。**"""
+        return {item["date_ms"]: item
+                for item in self._repository.limit_pool_sync_days(pool="limit_up")}
+
+    def _limit_up_evidence(self, date_ms: int, rules: UniverseRules,
+                           ledger: dict[int, dict] | None = None) -> LimitUpEvidence:
+        """构造当日的涨停剔除依据。**任何回落都必须带上理由**，不允许静默降级。"""
+        if rules.limit_up_source == "proxy_only":
+            return limit_up_evidence(date_ms, codes=None, rules=rules)
+        ledger = self._ledger() if ledger is None else ledger
+        item = ledger.get(date_ms)
+        status = item["status"] if item else None
+        codes = [row["thscode"] for row in self._repository.limit_pool_rows(
+            pool="limit_up", date_ms=date_ms)]
+        if codes:
+            return limit_up_evidence(
+                date_ms, codes=codes, rules=rules, sync_status=status,
+                reason=f"本地涨停池：{len(codes)} 只（台账 status={status}）")
+        if item is None:
+            reason = "本地没有该评估日的涨停池台账记录（该日未同步）"
+        elif status == "ok_empty":
+            reason = ("台账 status=ok_empty：接口成功但返回 0 条，可能是超出可回溯范围"
+                      "（实测涨停池 ≤2019 静默返回 0 条），**不能**当作『当天没有涨停』")
+        elif status in ("api_error", "transport_error"):
+            reason = (f"台账 status={status}（error_code={item['error_code']}），"
+                      "该日取数失败")
+        else:
+            reason = f"台账 status={status}，该日没有可用条目"
+        return limit_up_evidence(date_ms, codes=None, rules=rules, sync_status=status,
+                                 reason=reason)
+
     # --- 横截面排序 -------------------------------------------------------
     def rank(self, date_ms: int, *, rules: UniverseRules | None = None,
              factor_ids: tuple[str, ...] = FACTOR_IDS,
@@ -145,7 +183,9 @@ class ScreenerService:
         weights = {item: float((weights or {}).get(item, 1.0)) for item in factor_ids}
 
         raw = self._repository.cross_section(date_ms=date_ms)
-        kept, exclusions = apply_rules(raw, rules)
+        limit_up = self._limit_up_evidence(date_ms, rules)
+        diagnostics: dict = {}
+        kept, exclusions = apply_rules(raw, rules, limit_up=limit_up, diagnostics=diagnostics)
 
         # 逐因子算值 → 折算偏好分（0–1，越大越看多）
         values: dict[str, list[float | None]] = {}
@@ -194,7 +234,8 @@ class ScreenerService:
             row["rank"] = position
 
         params_hash = self._params_hash(date_ms=date_ms, rules=rules, factor_ids=factor_ids,
-                                       weights=weights, top_n=top_n)
+                                       weights=weights, top_n=top_n,
+                                       limit_up=limit_up)
         return {
             "as_of": _day(date_ms), "as_of_ms": date_ms,
             "params_hash": params_hash, "factor_set_version": FACTOR_SET_VERSION,
@@ -204,6 +245,9 @@ class ScreenerService:
                 "exclusions": exclusions, "rule_notes": RULE_NOTES,
                 "unsupported_exclusions": UNSUPPORTED_EXCLUSIONS,
                 "rules": rules.as_dict(),
+                # 涨停剔除用的是真实池还是代理，以及两种口径的分歧计数——这是
+                # "池子到底比代理好在哪"的唯一直接证据，所以逐日输出。
+                "limit_up": {**limit_up.as_dict(), "diagnostics": diagnostics},
             },
             "factors": [{**{"id": factor.id, "name": factor.name, "direction": factor.direction,
                             "prior": factor.prior}, "weight": weights[factor.id]}
@@ -216,10 +260,14 @@ class ScreenerService:
 
     @staticmethod
     def _params_hash(*, date_ms: int, rules: UniverseRules, factor_ids: tuple[str, ...],
-                     weights: dict[str, float], top_n: int | None) -> str:
+                     weights: dict[str, float], top_n: int | None,
+                     limit_up: LimitUpEvidence | None = None) -> str:
         payload = {"factor_set_version": FACTOR_SET_VERSION, "as_of_ms": date_ms,
                    "rules": rules.as_dict(), "factor_ids": list(factor_ids),
                    "weights": {key: round(value, 8) for key, value in sorted(weights.items())},
+                   # 口径进哈希：同一个评估日"用真实池剔除"与"用代理剔除"是两个不同的规则，
+                   # 不能共用一个 params_hash（否则两次结果会被误认为同一份可复现结果）。
+                   "limit_up_basis": None if limit_up is None else limit_up.as_dict(),
                    "top_n": top_n}
         canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
@@ -228,7 +276,8 @@ class ScreenerService:
     def ic_for_date(self, date_ms: int, *, horizon_days: int = 20,
                     rules: UniverseRules | None = None,
                     factor_ids: tuple[str, ...] = FACTOR_IDS,
-                    draws: int = PLACEBO_DRAWS, seed: int = 20260913) -> dict:
+                    draws: int = PLACEBO_DRAWS, seed: int = 20260913,
+                    ledger: dict[int, dict] | None = None) -> dict:
         """单个评估日的 Rank IC，以及**逐标的置乱**的安慰剂分布。
 
         IC 用「偏好分 vs 前向收益」的 Spearman 相关：方向已在偏好分里折进去，
@@ -243,9 +292,16 @@ class ScreenerService:
         """
         rules = rules or UniverseRules()
         raw = self._repository.cross_section(date_ms=date_ms)
-        kept, _ = apply_rules(raw, rules)
+        limit_up = self._limit_up_evidence(date_ms, rules, ledger=ledger)
+        diagnostics: dict = {}
+        kept, _ = apply_rules(raw, rules, limit_up=limit_up, diagnostics=diagnostics)
+        basis = {"basis": limit_up.basis, "reason": limit_up.reason,
+                 "sync_status": limit_up.sync_status, "pool_size": diagnostics["pool_size"],
+                 "proxy_only_kept": diagnostics["proxy_only"],
+                 "pool_only_caught": diagnostics["pool_only"],
+                 "excluded_limit_up": diagnostics["excluded_limit_up"]}
         if len(kept) < 20:
-            return {"as_of": _day(date_ms), "eligible": False,
+            return {"as_of": _day(date_ms), "eligible": False, "limit_up": basis,
                     "reason": f"股票池仅 {len(kept)} 只，不足 20 只，无法计算横截面 IC。",
                     "factors": {}}
         outcome = {row["thscode"]: row
@@ -253,7 +309,7 @@ class ScreenerService:
                        date_ms=date_ms, horizon_days=horizon_days)}
         rows = [row for row in kept if row["thscode"] in outcome]
         if len(rows) < 20:
-            return {"as_of": _day(date_ms), "eligible": False,
+            return {"as_of": _day(date_ms), "eligible": False, "limit_up": basis,
                     "reason": f"前向窗口齐备的标的仅 {len(rows)} 只（前瞻期 {horizon_days} 个交易日），"
                               "该评估日暂不参与 IC 统计。", "factors": {}}
         forward = [self._total_return(outcome[row["thscode"]]) for row in rows]
@@ -287,7 +343,7 @@ class ScreenerService:
                 "draws": len(placebo),
             }
         return {"as_of": _day(date_ms), "eligible": True, "horizon_days": horizon_days,
-                "samples": len(rows), "factors": report}
+                "samples": len(rows), "limit_up": basis, "factors": report}
 
     @staticmethod
     def _total_return(row: dict) -> float:
@@ -310,9 +366,19 @@ class ScreenerService:
         `t` 的可解释性依赖"各评估日的 IC 大致独立"：采样是按交易日等距抽取
         （默认 24 个点跨全历史、间隔约 100 个交易日），远大于前瞻期，重叠可忽略。
         """
+        ledger = self._ledger()
         per_date = [self.ic_for_date(date_ms, horizon_days=horizon_days, rules=rules,
-                                     factor_ids=factor_ids, draws=draws) for date_ms in dates]
+                                     factor_ids=factor_ids, draws=draws, ledger=ledger)
+                    for date_ms in dates]
         usable = [item for item in per_date if item["eligible"]]
+        # 口径覆盖：**必须报出来**。若 24 个评估日里只有 3 天有真实池，那么这份 IC 报告
+        # 基本上仍然是代理口径下的结论——不给这个数字，读者会以为涨停剔除已经全面换成交易所口径。
+        basis_counts: dict[str, int] = {}
+        for item in per_date:
+            key = (item.get("limit_up") or {}).get("basis", "unknown")
+            basis_counts[key] = basis_counts.get(key, 0) + 1
+        pool_only = sum((item.get("limit_up") or {}).get("pool_only_caught", 0) for item in per_date)
+        proxy_only = sum((item.get("limit_up") or {}).get("proxy_only_kept", 0) for item in per_date)
         summary = {}
         for factor_id in factor_ids:
             entries = [item["factors"][factor_id] for item in usable
@@ -341,6 +407,17 @@ class ScreenerService:
             }
         return {"horizon_days": horizon_days, "dates_requested": len(dates),
                 "dates_usable": len(usable), "placebo_draws": draws,
+                "limit_up_basis_by_date": basis_counts,
+                "limit_up_note": "本报告的 IC 是在**上面这个口径分布**下算出来的："
+                                 "`real_limit_up_pool` 为交易所口径，`price_volume_proxy` 为回落口径。"
+                                 "若代理口径占多数，则结论主要反映代理口径，"
+                                 "**不得**表述为『已按交易所口径剔除涨跌停』。",
+                "limit_up_disagreement": {
+                    "pool_only_caught": pool_only,
+                    "proxy_only_kept": proxy_only,
+                    "note": "两种口径在全部评估日上的分歧合计：`pool_only_caught` 是真实池抓到、"
+                            "代理漏掉的（典型是 ST 的 5% 涨停）；`proxy_only_kept` 是代理误判为"
+                            "涨停、但真实池里没有因此**保留**的。"},
                 "sampling": "按交易日等距抽取，间隔远大于前瞻期，IC 之间近似独立",
                 "method": "显著性 = IC 时间序列的 t 值；安慰剂（逐标的置乱）仅作机制自检，"
                           "其零分布离散度远小于真实 IC 离散度（实测差 4–7 倍），"

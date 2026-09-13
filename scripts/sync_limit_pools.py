@@ -9,10 +9,14 @@
 
     # 只回补涨停池到 2022（实测可回溯；约 1130 个交易日 = 1130 次请求）
     .\\.venv\\Scripts\\python.exe scripts\\sync_limit_pools.py `
-        --from 2022-01-04 --to 2026-09-04 --pools limit_up
+        --from 2022-01-04 --to 2026-09-04 --pools limit_up --skip-synced
 
     # 先干跑看规模，不发请求
     .\\.venv\\Scripts\\python.exe scripts\\sync_limit_pools.py --days 20 --dry-run
+
+深回补要点：**必须带 `--skip-synced`**。1130 次请求要跑十几分钟，中途任何原因断掉后，
+重跑时若不带该参数会把已经取过的日子**重新发一遍请求**（同花顺是免费但限流的接口，
+浪费配额且不礼貌）。跳过的组合以 `status=skipped` 计入汇总，如实计数。
 """
 from __future__ import annotations
 
@@ -82,6 +86,11 @@ async def main() -> int:
     parser.add_argument("--page-size", type=int, default=200, help="单页条数（上限 200）")
     parser.add_argument("--dry-run", action="store_true", help="只报告规模，不发请求")
     parser.add_argument("--proxy", default="", help="如需代理，如 http://127.0.0.1:7890")
+    parser.add_argument("--sleep", type=float, default=0.15,
+                        help="每次请求后的间隔秒数（默认 0.15，礼貌起见）")
+    parser.add_argument("--skip-synced", action="store_true",
+                        help="跳过台账里已有记录的日子（深回补断点续跑用；失败的日子也会被跳过，"
+                             "要重试请去掉本参数）")
     args = parser.parse_args()
 
     pools = [item.strip() for item in args.pools.split(",") if item.strip()]
@@ -124,8 +133,13 @@ async def main() -> int:
                                  timeout=httpx.Timeout(40, connect=15), **client_kwargs) as http:
         market = MarketDataService(integrations, storage, http)
         sync = LimitPoolSync(repository, market.credential_source)
+        already = sync.synced_keys() if args.skip_synced else None
+        if already:
+            hit = sum(1 for date_ms in dates for pool in pools if (date_ms, pool) in already)
+            print(f"  --skip-synced：{hit}/{len(dates) * len(pools)} 个组合台账已有记录，将跳过")
         summary = await sync.sync_dates(http, dates, pools, page_size=args.page_size,
-                                        progress=progress)
+                                        progress=progress, already=already,
+                                        sleep_seconds=args.sleep)
 
     print("\n== 汇总 ==")
     print(f"  请求 {summary['requests']} 次，落库 {summary['rows']} 行，"

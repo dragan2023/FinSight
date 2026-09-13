@@ -22,6 +22,8 @@ import duckdb  # noqa: E402
 
 from backend.app.market_warehouse.repository import WarehouseRepository  # noqa: E402
 from backend.app.screener import ScreenerService, UniverseRules  # noqa: E402
+from backend.app.screener.universe import (BASIS_LIMIT_UP_PROXY,  # noqa: E402
+                                           BASIS_REAL_LIMIT_UP_POOL)
 from backend.app.settings import load_settings  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
@@ -80,6 +82,14 @@ def main() -> int:
     print(f"评估日 {day}｜横截面 {universe['raw_symbols']} 只 → 入池 {universe['kept']} 只"
           f"（{time.time() - started:.1f}s）")
     print("排除：" + "；".join(f"{RULE_LABEL.get(k, k)} {v}" for k, v in universe["exclusions"].items()))
+    limit_up = universe["limit_up"]
+    diag = limit_up["diagnostics"]
+    print(f"涨停剔除口径：{BASIS_LABEL.get(limit_up['basis'], limit_up['basis'])}"
+          f"（池 {limit_up['pool_codes']} 只，台账 status={limit_up['sync_status']}）")
+    if limit_up["basis"] != BASIS_REAL_LIMIT_UP_POOL:
+        print(f"  ⚠ 回落理由：{limit_up['reason']}")
+    print(f"  与代理的分歧：代理说有、池子没有而**保留** {diag['proxy_only']} 只；"
+          f"池子有、代理漏掉而**剔除** {diag['pool_only']} 只（典型是 ST 的 5% 涨停）")
     print(f"params_hash = {pool['params_hash']}｜候选 {pool['candidate_count']} 只"
           f"（标注为「{pool['label']}」）")
     for row in pool["candidates"][:5]:
@@ -94,6 +104,12 @@ def main() -> int:
                                    draws=args.draws)
         print(f"\n因子评价：{report['dates_usable']}/{report['dates_requested']} 个评估日可用"
               f"（{time.time() - started:.1f}s，每个评估日 {args.draws} 次安慰剂重排）")
+        basis = "；".join(f"{BASIS_LABEL.get(k, k)} {v} 天"
+                         for k, v in report["limit_up_basis_by_date"].items())
+        print(f"涨停剔除口径覆盖：{basis}")
+        disagreement = report["limit_up_disagreement"]
+        print(f"  两种口径分歧合计：池子抓到、代理漏掉 {disagreement['pool_only_caught']} 只；"
+              f"代理误判、保留 {disagreement['proxy_only_kept']} 只")
         print(f"{'因子':<18}{'方向':<6}{'均值IC':>9}{'IC标准差':>10}{'t值':>8}{'IC>0占比':>10}")
         for factor_id, item in report["factors"].items():
             if not item.get("dates"):
@@ -126,8 +142,13 @@ def main() -> int:
 
 RULE_LABEL = {
     "non_positive_price": "价格异常", "insufficient_history": "历史不足",
-    "below_min_turnover": "成交额过低", "suspected_limit_up": "疑似涨停",
-    "no_bar_on_date": "当日无成交",
+    "below_min_turnover": "成交额过低", "suspected_limit_up": "疑似涨停（代理口径）",
+    "confirmed_limit_up": "涨停（真实池口径）", "no_bar_on_date": "当日无成交",
+}
+
+BASIS_LABEL = {
+    BASIS_REAL_LIMIT_UP_POOL: "同花顺涨停池（交易所口径）",
+    BASIS_LIMIT_UP_PROXY: "价量代理（涨幅 ≥ 9.8% 且收盘 = 最高）",
 }
 
 
