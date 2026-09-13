@@ -94,9 +94,10 @@
 7. `backend/app/strategy/local_bars.py`：本地总收益口径日 K（as-of 截断，不联网）。
 8. `backend/app/governance/service.py`：预注册、批次隔离与变更留痕。
 
-> **已知实现与文档的差异（登记在案，未修）**：`strategy/backtest.py` 的净值曲线
-> 只按 `close_i / close_{i-1}` 累积，**开盘价不参与净值计算**（只写进 trade 日志），
-> 与代码注释声称的"次日开盘成交"不完全一致；`trades[].return_pct` 又按 `open→open` 计算，
-> 于是同一笔交易有两个收益率。见 `docs/荐股治理方案/07` §4.3 与治理台账
-> `hypothesis_registry` 的 `backtest_execution_price@1`（状态 `draft`）。
-> 修改它会改变回测语义，必须走 `record_change` 并重跑受影响实验。
+> **执行口径已修正（F23，2026-09-13）**：`strategy/backtest.py` 原先在换手当日沿用
+> `close_i / close_{i-1}`，而 `trades[].return_pct` 按 `open → open` ——同一笔交易两个收益率。
+> 现在一律按**成交价（开盘）**盯市，于是**一笔交易期间的净值比恰好等于该笔交易的收益率**。
+> 影响：真实数据（有跳空）候选数 **143 → 118**、跑赢基准 **36 → 28**，即旧记账**系统性偏乐观**；
+> 无跳空时两套算法代数上等价，这正是缺陷长期隐身的原因。判定不变且更强（D17/D18）。
+> 该变更已走 `record_change`（治理台账 `backtest_execution_price@1` 已 `frozen`）。
+> 详见 `docs/荐股治理方案/11_F23执行口径修正与重跑.md`。

@@ -54,7 +54,11 @@ def current_signal_snapshot(strategy_id: str, bars: list[PriceBar], *, gate: dic
 def run_backtest(strategy_id: str, bars: list[PriceBar], cost_bps: int, *, gate: dict | None = None) -> dict:
     features=feature_rows(bars, **(gate or {})); position=0; entry=None; held=0; cash=1.0; benchmark=1.0; peak=1.0; trades=[]; curve=[]; costs=cost_bps/10000
     for i, bar in enumerate(bars):
-        # execute yesterday's signal at today's open, never at signal day's close
+        # 信号在 i-1 收盘后形成，最早只能在 i 的开盘成交——净值曲线必须与这个执行
+        # 模型**一致**：换手当日按成交价（开盘）盯市，而不是按「前收→收盘」的整段涨跌。
+        # 旧实现在换手当日沿用 close_i/close_{i-1}，等于按前收成交却只按开盘扣成本，
+        # 有跳空时开仓偏乐观、平仓漏掉隔夜变动，而且与 trades[].return_pct（open→open）
+        # 互相矛盾。**无跳空时两种算法恰好相同**，所以这个缺陷长期没被发现。
         execute = i>0 and bars[i].open is not None
         previous=features[i-1] if i else {}
         desired=0
@@ -64,17 +68,23 @@ def run_backtest(strategy_id: str, bars: list[PriceBar], cost_bps: int, *, gate:
             else:
                 desired = int(held < 5) if position else int(bool(previous.get("ret5_q10") is not None and previous.get("ret5") is not None and previous["ret5"]<=previous["ret5_q10"] and previous.get("ma60") and bars[i-1].close>previous["ma60"]))
             if not gate_ok and not position: desired=0
-        if execute and desired != position:
-            if position:
-                cash *= (1-costs)
-                trades[-1]["exit_date"] = bar.date
-                trades[-1]["exit_price"] = bar.open
-                # 实际平仓同时承担开仓与平仓两次成本；此前只扣了一次成本，
-                # 会让成交胜率和单笔盈亏轻微乐观，虽然净值曲线已正确扣费。
-                trades[-1]["return_pct"] = round(((bar.open / entry) * (1-costs) ** 2 - 1) * 100, 4)
-                position=0; held=0
-            if desired: cash *= (1-costs); position=1; entry=bar.open; held=0; trades.append({"entry_date":bar.date,"entry_price":bar.open})
-        if i and position: cash *= bar.close/bars[i-1].close; held += 1
+        # `desired != position` 时恰好只有一支分支会执行（旧代码同样如此）。
+        if execute and desired != position and position:
+            # 先按开盘价把已有仓位盯市到成交时点，再扣平仓成本。
+            cash *= bar.open/bars[i-1].close
+            cash *= (1-costs)
+            trades[-1]["exit_date"] = bar.date
+            trades[-1]["exit_price"] = bar.open
+            trades[-1]["return_pct"] = round(((bar.open / entry) * (1-costs) ** 2 - 1) * 100, 4)
+            position=0; held=0
+        elif execute and desired != position and desired:
+            cash *= (1-costs)                 # 开仓成本按开盘成交价计
+            position=1; entry=bar.open; held=0
+            trades.append({"entry_date":bar.date,"entry_price":bar.open})
+            cash *= bar.close/bar.open        # 从成交价盯市到当日收盘
+        elif i and position:
+            cash *= bar.close/bars[i-1].close
+        if i and position: held += 1
         if i: benchmark *= bar.close/bars[i-1].close
         peak=max(peak,cash); curve.append({"period":bar.date,"net_value":round(cash,6),"benchmark_net_value":round(benchmark,6),"drawdown_pct":round((cash/peak-1)*100,4),"position":position})
     if position and trades:
