@@ -99,6 +99,22 @@ FIELDS = (
 
 SCAN_REFERENCE = "limit_up_event_study_design@v1"
 
+#: **派生字段**（换口径＝新定义，A.1）。与池子原生字段分开登记，reference 也不同。
+DERIVED_FIELD_DECLARATIONS = (
+    {
+        "reference": "limit_up_event:seal_ratio@v1",
+        "name": "封成比（封单额 ÷ 当日成交额）",
+        "direction": "high",
+        "prior": "封单额相对**当日成交额**越大，说明买盘承接相对越强、抛压相对越轻；"
+                 "先验认为封成比越高，事件后短期表现越好。",
+        "note": "**新定义，不是 seal_money 的改名**（A.1：变更视为新条目）。"
+                "它存在的直接原因是 D44——`seal_money` 是绝对金额、与市值正相关，"
+                "而 v3 的三个变体都没有匹配市值。分母取**当日成交额**：封板日成交额本身被"
+                "压缩，因此该比值同时刻画『封单有多厚』与『有多没人卖』。"
+                "本地仍无流通股本/市值数据，所以这只**削弱**规模混淆，不等于消除。",
+    },
+)
+
 #: v3：**稳健性检验的完整清单**，在与运行结果无关时就预先声明。
 #: 这一步的意义就是"先写下要看哪些比较、门槛是多少，再去看数字"。
 DESIGN_V3_REFERENCE = "limit_up_event_study_design@v3"
@@ -133,8 +149,34 @@ DESIGN_V3 = {
     "status": "已预注册，**结果尚未产生**（本条目与运行之间没有任何根据结果调整的余地）",
 }
 
-#: 首次执行后登记的**设计修正**。按方案 A.1「登记后不得改名或改定义——变更视为新条目」，
-#: 所以不是去改 @v1，而是新开 @v2。
+#: v4：**换口径＝新定义**（D44）。封成比 = 封单额 ÷ **当日成交额**（无量纲），
+#: 用来排掉"封单额是绝对金额、与市值正相关"那个混淆。清单同样在运行前登记。
+DESIGN_V4_REFERENCE = "limit_up_event_study_design@v4"
+DESIGN_V4 = {
+    "supersedes_note": "@v3 的清单针对 seal_money；@v4 是**新定义** seal_ratio 的清单。",
+    "primary_endpoint": "seal_ratio@base_all 的『高组 − 低组』",
+    "new_definition": {
+        "field": "seal_ratio",
+        "formula": "seal_money ÷ turnover_today（当日成交额）",
+        "why_this_denominator": "封单额是**绝对金额（元）**，大市值/高价股天然封单更大，"
+                                "而 v3 的三个变体都没有匹配市值 → D44 认定存在未排除的规模混淆。"
+                                "除以**当日成交额**后该比值无量纲：既不含绝对规模，也顺带刻画了"
+                                "『封板日成交被压缩、没人卖』这一层。",
+        "missing_policy": "当日成交额缺失或 ≤ 0 时**不给值**（既不算高组也不算低组）。"
+                          "拿 0 或全网均值去凑会把『缺数据』做成『低封成比』——"
+                          "那正是 C2 里『缺失值不填 0』要防的同一类错误。",
+        "residual_limitation": "封成比排掉的是**成交额口径**的规模；本地仍**没有流通股本/市值**"
+                               "数据，所以『真正的市值匹配』仍未做到，只能说混淆被削弱而非消除。",
+    },
+    "variants_declared": ["base_all", "matched_all", "base_first_board", "base_multi_board"],
+    "variant_definitions": "与 @v3 逐字相同（同一套分层与事前匹配，保证可比）",
+    "replication": "与 @v3 相同：2022–2024 与 2025-01-01 起。",
+    "family_multiplicity": "本族（封单类）此前已在 @v3 看过 **20** 条比较 → "
+                           "本轮的族级计数 = 20（本次）+ 20（此前）= **40**，"
+                           "族级 Bonferroni 门槛据此计算并在报告中一并给出。",
+    "forbidden": "看到结果后增删变体、改分母、改分层阈值；要改必须新开 reference。",
+    "status": "已预注册，**结果尚未产生**",
+}
 DESIGN_V2_REFERENCE = "limit_up_event_study_design@v2"
 DESIGN_V2 = {
     "supersedes": SCAN_REFERENCE,
@@ -241,6 +283,35 @@ def main() -> int:
             exploratory=True, trial_count=len(FIELDS),
             notes="**先登记清单，再运行**：8 个变体、2 条主检验端点、分时段复现、"
                   "以及多重检验门槛都写在看到数字之前。")
+
+    if DESIGN_V4_REFERENCE in existing:
+        plan.append(f"skip  {DESIGN_V4_REFERENCE}（已登记）")
+    else:
+        plan.append(f"add   {DESIGN_V4_REFERENCE}（kind=scan, 新定义清单）")
+    if DESIGN_V4_REFERENCE not in existing and not args.dry_run:
+        governance.register_hypothesis(
+            kind="scan", name="涨停池事件研究：封成比（新定义）预注册清单",
+            reference=DESIGN_V4_REFERENCE,
+            definition={**DOMAIN, **DESIGN_V4}, direction="无方向（清单登记）",
+            exploratory=True, trial_count=1,
+            notes="D44 的直接执行：把封单额换成**无量纲的封成比**再验一遍。"
+                  "清单、门槛与族级多重检验计数都在看到数字之前写入。")
+
+    for declaration in DERIVED_FIELD_DECLARATIONS:
+        reference = declaration["reference"]
+        if reference in existing:
+            plan.append(f"skip  {reference}（已登记）")
+            continue
+        plan.append(f"add   {reference}（kind=factor, exploratory, 派生字段）")
+        if args.dry_run:
+            continue
+        governance.register_hypothesis(
+            kind="factor", name=declaration["name"], reference=reference,
+            direction=declaration["direction"],
+            definition={"id": reference, "prior": declaration["prior"], **DOMAIN, **DESIGN_V4},
+            params={"formula": DESIGN_V4["new_definition"]["formula"],
+                    "design": DESIGN_V4_REFERENCE, "horizon_days": 20},
+            exploratory=True, trial_count=1, notes=declaration["note"])
 
     batch_id = governance.current_batch_id()
     if batch_id and not args.dry_run:

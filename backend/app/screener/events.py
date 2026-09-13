@@ -63,6 +63,35 @@ FIELD_ENCODINGS = {
 #: 成交额分位桶数（十分位）；事前动量的分组数（三分位）。
 DECILES = 10
 PRIOR_GROUPS = 3
+
+
+def _ratio(numerator, denominator) -> float | None:
+    """比值；分子分母必须都是数字且分母 > 0。**不做截断**（截断就是调参）。"""
+    if not isinstance(numerator, (int, float)) or not isinstance(denominator, (int, float)):
+        return None
+    if denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+#: **派生字段**：由「涨停池条目 × 当日横截面」算出来，而不是池子接口直接给的。
+#: 定义只写在这里一处，评估侧与登记侧引用同一份说明。
+DERIVED_FIELDS = {
+    "seal_ratio": {
+        "name": "封成比（封单额 ÷ 当日成交额）",
+        "groups": ("封成比高(>当日池内中位数)", "封成比低(≤中位数)"),
+        "split": "按**当日池内中位数**分组（相对口径，不是绝对金额）",
+        "rule": lambda value, median: (None if not isinstance(value, (int, float))
+                                       or median is None else value > median),
+        "build": lambda item, row: _ratio(item.get("seal_money"), row.get("turnover_today")),
+        "note": "分母用**当日成交额**：封板日的成交额本身被压缩，因此这个比值同时刻画"
+                "「封单有多厚」与「有多没人卖」。它是无量纲的，**不含绝对规模**——"
+                "这正是为了排掉『封单额与市值正相关』那个混淆（D44）。",
+    },
+}
+
+#: 评估侧统一用这张表（池子原生字段 + 派生字段）。
+ALL_FIELDS = {**FIELD_ENCODINGS, **DERIVED_FIELDS}
 #: 日期错位的最短/最大位移（交易日索引）；该安慰剂已判定无效，仅保留为诊断。
 MIN_SHIFT = 25
 MAX_SHIFT = 250
@@ -157,10 +186,11 @@ class LimitUpEventStudy:
 
     @staticmethod
     def _strata(field: str):
-        """每个字段**预先声明**的子样本层（v2 稳健性检验）。
+        """每个字段**预先声明**的子样本层（v2/v3 稳健性检验）。
 
         池内分层是"同日同池的相对比较"，对"这类标的本来就这样"的混淆免疫：
         两组都是涨停股、同一天、同一套对照，差别只在分组变量上。
+        **同一族的字段共用同一套分层**（`seal_*` 都是"封单类"，按连板结构分）。
         """
         def above(value, median):
             return isinstance(value, (int, float)) and median is not None and value > median
@@ -168,8 +198,8 @@ class LimitUpEventStudy:
         def at_or_below(value, median):
             return isinstance(value, (int, float)) and median is not None and value <= median
 
-        if field == "seal_money":
-            # 封单额的区分度会不会只是"连板结构"的影子？在首板/连板内部各自再比一次。
+        if field in ("seal_money", "seal_ratio"):
+            # 封单类变量的区分度会不会只是"连板结构"的影子？在首板/连板内部各自再比一次。
             return (("all", lambda item, med: True),
                     ("first_board", lambda item, med: item.get("continue_day_cnt") == 1),
                     ("multi_board",
@@ -180,6 +210,28 @@ class LimitUpEventStudy:
                  lambda item, med: above(item.get("seal_money"), med.get("seal_money"))),
                 ("low_seal",
                  lambda item, med: at_or_below(item.get("seal_money"), med.get("seal_money"))))
+
+    @staticmethod
+    def _field_values(field: str, pool: dict[str, dict],
+                      cross_by_symbol: dict[str, dict]) -> dict[str, float]:
+        """当日**池内**该字段的取值（派生字段在这里算）。
+
+        派生字段缺当日横截面行或分母 ≤ 0 时**不给值**——绝不能拿 0 或全网均值去凑，
+        否则"缺数据"会被当成"低封成比"混进低组，直接把结论做出来。
+        """
+        if field in DERIVED_FIELDS:
+            build = DERIVED_FIELDS[field]["build"]
+            values = {}
+            for symbol, item in pool.items():
+                row = cross_by_symbol.get(symbol)
+                if row is None:
+                    continue
+                value = build(item, row)
+                if value is not None:
+                    values[symbol] = value
+            return values
+        return {symbol: item[field] for symbol, item in pool.items()
+                if isinstance(item.get(field), (int, float))}
 
     @staticmethod
     def _is_replication(date_ms: int) -> bool:
@@ -234,14 +286,17 @@ class LimitUpEventStudy:
             return {}
 
         details: dict[str, dict] = {}
+        cross_by_symbol = {row["thscode"]: row for row in cross}
+        # 分层要用到**另一个字段**的中位数（例如"封单高"这一层）。原生字段与派生字段
+        # 都按同一套 `_field_values` 取，绝不两处各写一遍。
+        field_values = {name: self._field_values(name, pool, cross_by_symbol)
+                        for name in ALL_FIELDS}
+        medians = {name: (sorted(values.values())[len(values) // 2] if values else None)
+                   for name, values in field_values.items()}
+
         for field in fields:
-            encoding = FIELD_ENCODINGS[field]
-            # 分层要用到**另一个字段**的中位数（例如"封单高"这一层）
-            medians = {}
-            for other in FIELD_ENCODINGS:
-                numeric = sorted(item[other] for item in pool.values()
-                                 if isinstance(item.get(other), (int, float)))
-                medians[other] = numeric[len(numeric) // 2] if numeric else None
+            encoding = ALL_FIELDS[field]
+            values = field_values[field]
             median = medians[field]
 
             variants: dict[str, dict] = {}
@@ -253,13 +308,12 @@ class LimitUpEventStudy:
                     means = fine_mean if matched else coarse_mean
                     grids = fine if matched else coarse
                     events: dict[str, list[tuple]] = {"high": [], "low": []}
-                    for item in pool.values():
-                        symbol = item.get("thscode")
+                    for symbol, item in pool.items():
                         if symbol not in outcome or symbol not in buckets:
                             continue
                         if not predicate(item, medians):
                             continue
-                        flag = encoding["rule"](item.get(field), median)
+                        flag = encoding["rule"](values.get(symbol), median)
                         if flag is None:
                             continue
                         key = ((buckets[symbol], terciles.get(symbol, -1)) if matched
@@ -365,7 +419,7 @@ class LimitUpEventStudy:
                         variant: str, draws: int) -> dict:
         entries = [per_date[date_ms]["variants"][variant] for date_ms in usable]
         results = {}
-        for side, label in zip(("high", "low"), FIELD_ENCODINGS[field]["groups"]):
+        for side, label in zip(("high", "low"), ALL_FIELDS[field]["groups"]):
             series = [entry[f"{side}_excess"] for entry in entries]
             results[side] = {
                 "group": label, "events": sum(entry[f"{side}_events"] for entry in entries),
@@ -407,7 +461,8 @@ class LimitUpEventStudy:
         }
 
     def _report(self, field: str, per_date: dict[int, dict], *, horizon_days: int,
-                draws: int, seed: int, dates_with_pool: int) -> dict:
+                draws: int, seed: int, dates_with_pool: int,
+                family_prior_statistics: int = 0) -> dict:
         usable = sorted(per_date)
         names = sorted(per_date[usable[0]]["variants"]) if usable else []
         variants = {name: self._variant_report(field, per_date, usable, name, draws)
@@ -430,11 +485,13 @@ class LimitUpEventStudy:
                     "t_stat": _t_stat(series)}
 
         statistics_tested = len(variants) * 3 + len(replication)
+        family_total = statistics_tested + max(0, int(family_prior_statistics))
         primary_threshold = round(_z_for_two_sided(0.05 / 2), 3)
         all_threshold = round(_z_for_two_sided(0.05 / statistics_tested), 3)
+        family_threshold = round(_z_for_two_sided(0.05 / family_total), 3)
         return {
-            "field": field, "field_name": FIELD_ENCODINGS[field]["name"],
-            "groups": FIELD_ENCODINGS[field]["groups"], "split": FIELD_ENCODINGS[field]["split"],
+            "field": field, "field_name": ALL_FIELDS[field]["name"],
+            "groups": ALL_FIELDS[field]["groups"], "split": ALL_FIELDS[field]["split"],
             "horizon_days": horizon_days, "draws": draws,
             "dates_with_pool": dates_with_pool, "dates_usable": len(usable),
             "events_total": base.get("events", 0),
@@ -452,9 +509,13 @@ class LimitUpEventStudy:
                 "per_test_abs_t": 1.96,
                 "bonferroni_primary_abs_t": primary_threshold,
                 "bonferroni_all_abs_t": all_threshold,
+                "family_prior_statistics": max(0, int(family_prior_statistics)),
+                "family_total_statistics": family_total,
+                "bonferroni_family_abs_t": family_threshold,
                 "note": "按方案 A.2，多重检验计数必须包含**全部尝试过的**比较（含本轮新增的"
-                        "稳健性变体与分时段复现）；主检验只有 2 条，其余是稳健性检验。"
-                        "两套门槛都给出来，读者可自行判断哪些结论同时过严格门槛。",
+                        "稳健性变体、分时段复现，以及**同一族此前已做过的**比较——"
+                        "`family_prior_statistics` 就是上一轮已看过的条数）；主检验只有 2 条，"
+                        "其余是稳健性检验。三套门槛都给出来，读者可自行判断哪些结论同时过严格门槛。",
             },
             "placebo": {
                 "permutation": {**base.get("placebo", {}),
@@ -464,7 +525,8 @@ class LimitUpEventStudy:
                 "date_shift": self._date_shift_placebo(per_date, usable, draws=draws, seed=seed),
             },
             "significance": "看 t 值。逐检验门槛 1.96；多重检验校正后的门槛见 `multiplicity`"
-                            f"（主检验 |t|≥{primary_threshold}，全部比较 |t|≥{all_threshold}）。"
+                            f"（主检验 |t|≥{primary_threshold}，本次全部比较 |t|≥{all_threshold}，"
+                            f"含同族此前比较的 |t|≥{family_threshold}）。"
                             "安慰剂只作机制自检，**不得**当作显著性门槛。",
             "design": "hypothesis_registry: limit_up_event_study_design@v1 / @v2",
             "limitations": [
@@ -487,11 +549,12 @@ class LimitUpEventStudy:
     # --- 主入口 -----------------------------------------------------------
     def run_fields(self, *, fields: tuple[str, ...], start_ms: int | None = None,
                    end_ms: int | None = None, horizon_days: int = 20, draws: int = 200,
-                   seed: int = 20260913, progress=None) -> dict[str, dict]:
+                   seed: int = 20260913, progress=None,
+                   family_prior_statistics: int = 0) -> dict[str, dict]:
         """**一次遍历**算出多个字段的全部变体：取数只做一遍，字段与变体各自分组与重抽。"""
-        unknown = [item for item in fields if item not in FIELD_ENCODINGS]
+        unknown = [item for item in fields if item not in ALL_FIELDS]
         if unknown:
-            raise ValueError(f"不支持的事件研究字段：{unknown}（可选 {list(FIELD_ENCODINGS)}）")
+            raise ValueError(f"不支持的事件研究字段：{unknown}（可选 {list(ALL_FIELDS)}）")
         if not fields:
             raise ValueError("至少要指定一个字段。")
         if draws < 1 or not 1 <= horizon_days <= 250:
@@ -530,7 +593,8 @@ class LimitUpEventStudy:
                     "reason": "没有任何评估日同时齐备『池内标的 + 同层对照 + 前向窗口』。"}
                 continue
             reports[field] = self._report(field, per_field[field], horizon_days=horizon_days,
-                                          draws=draws, seed=seed, dates_with_pool=len(dates))
+                                          draws=draws, seed=seed, dates_with_pool=len(dates),
+                                          family_prior_statistics=family_prior_statistics)
         return reports
 
     def run(self, *, start_ms: int | None = None, end_ms: int | None = None,

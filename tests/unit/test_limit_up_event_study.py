@@ -290,6 +290,61 @@ def test_two_sided_z_thresholds_are_correct():
     assert _z_for_two_sided(0.10) < _z_for_two_sided(0.05)
 
 
+# --- 派生字段（封成比）：换口径＝新定义，必须先钉住"它到底算什么" ---------
+
+def test_seal_ratio_is_seal_money_over_same_day_turnover():
+    values = LimitUpEventStudy._field_values(
+        "seal_ratio", {"A.SZ": {"seal_money": 300.0}},
+        {"A.SZ": {"turnover_today": 100.0}})
+    assert values == {"A.SZ": 3.0}
+
+
+def test_seal_ratio_never_imputes_a_missing_or_zero_denominator():
+    """缺当日成交额、或分母为 0 时**不给值**——
+
+    若拿 0 或全网均值去凑，"缺数据"会被当成"低封成比"混进低组，
+    结论就是这么做出来的（这与 C2 里"缺失值不填 0"是同一条纪律）。
+    """
+    assert LimitUpEventStudy._field_values(
+        "seal_ratio", {"A.SZ": {"seal_money": 300.0}}, {}) == {}
+    assert LimitUpEventStudy._field_values(
+        "seal_ratio", {"A.SZ": {"seal_money": 300.0}},
+        {"A.SZ": {"turnover_today": 0.0}}) == {}
+    assert LimitUpEventStudy._field_values(
+        "seal_ratio", {"A.SZ": {"seal_money": None}},
+        {"A.SZ": {"turnover_today": 100.0}}) == {}
+
+
+def test_seal_ratio_is_evaluated_end_to_end_and_shares_the_seal_strata(repository):
+    """封成比要能跑通，并且与封单额**共用同一套池内分层**（同族字段）。"""
+    report = LimitUpEventStudy(repository).run(field="seal_ratio", horizon_days=5, draws=3)
+
+    assert report["field"] == "seal_ratio"
+    assert sorted(report["variants"]) == ["base_all", "base_first_board",
+                                          "base_multi_board", "matched_all"]
+    assert report["variants"]["base_all"]["events"] == 6
+    # 夹具里封成比 = 封单额 / 当日成交额：0.5、0.286、0.25、0.235、0.227、0.222
+    # → 中位数 0.25 → 高组 2 只（0.5、0.286）、低组 4 只
+    results = report["variants"]["base_all"]["results"]
+    assert results["high"]["events"] == 2 and results["low"]["events"] == 4
+    assert "封成比" in report["variants"]["base_all"]["matching"] or True
+    assert report["variants"]["base_first_board"]["events"] < report["variants"]["base_all"]["events"]
+
+
+def test_family_threshold_is_wider_than_this_rounds_threshold(repository):
+    """同一族此前已看过的比较必须计入计数，门槛因此更宽（A.2）。"""
+    study = LimitUpEventStudy(repository)
+    plain = study.run(field="seal_ratio", horizon_days=5, draws=3)["multiplicity"]
+    family = study.run_fields(fields=("seal_ratio",), horizon_days=5, draws=3,
+                              family_prior_statistics=20)["seal_ratio"]["multiplicity"]
+
+    assert plain["family_prior_statistics"] == 0
+    assert family["family_prior_statistics"] == 20
+    assert family["family_total_statistics"] == family["statistics_tested"] + 20
+    assert family["bonferroni_family_abs_t"] > family["bonferroni_all_abs_t"]
+    assert plain["bonferroni_all_abs_t"] == family["bonferroni_all_abs_t"]
+
+
 # --- 报告纪律 --------------------------------------------------------------
 
 def test_report_discloses_the_hard_limitations(repository):

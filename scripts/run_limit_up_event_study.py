@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from backend.app.market_warehouse.repository import WarehouseRepository  # noqa: E402
-from backend.app.screener.events import FIELD_ENCODINGS, LimitUpEventStudy  # noqa: E402
+from backend.app.screener.events import ALL_FIELDS, LimitUpEventStudy  # noqa: E402
 from backend.app.settings import load_settings  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
@@ -44,10 +44,12 @@ def main() -> int:
             pass
     parser = argparse.ArgumentParser(description="涨停事件研究（预注册设计）")
     parser.add_argument("--field", default="all",
-                        choices=sorted(FIELD_ENCODINGS) + ["all"],
-                        help="要研究的池子字段；all = 一次遍历把全部字段都算出来（默认）")
+                        choices=sorted(ALL_FIELDS) + ["all"],
+                        help="要研究的字段；all = 一次遍历把全部字段都算出来")
     parser.add_argument("--horizon", type=int, default=20, help="前瞻期（交易日）")
     parser.add_argument("--draws", type=int, default=200, help="安慰剂重抽次数")
+    parser.add_argument("--family-prior-statistics", type=int, default=0,
+                        help="同一族**此前已看过**的比较条数（A.2：多重检验计数必须含它）")
     parser.add_argument("--from", dest="from_text", default="", help="起始交易日 YYYY-MM-DD")
     parser.add_argument("--to", dest="to_text", default="", help="结束交易日 YYYY-MM-DD")
     parser.add_argument("--out", default="")
@@ -56,7 +58,7 @@ def main() -> int:
     settings = load_settings()
     repository = WarehouseRepository(settings.market_warehouse_path)
     study = LimitUpEventStudy(repository)
-    fields = tuple(sorted(FIELD_ENCODINGS)) if args.field == "all" else (args.field,)
+    fields = tuple(sorted(ALL_FIELDS)) if args.field == "all" else (args.field,)
 
     def to_ms(text: str) -> int | None:
         return (int(datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=CST).timestamp() * 1000)
@@ -79,7 +81,8 @@ def main() -> int:
         print(f"  {index}/{total} 已处理，可用 {brief}（{time.time() - started:.0f}s）", flush=True)
 
     reports = study.run_fields(fields=fields, start_ms=start_ms, end_ms=end_ms,
-                               horizon_days=args.horizon, draws=args.draws, progress=progress)
+                               horizon_days=args.horizon, draws=args.draws, progress=progress,
+                               family_prior_statistics=args.family_prior_statistics)
     elapsed = time.time() - started
 
     out_dir = (Path(args.out) if args.out
@@ -88,7 +91,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     exit_code = 0
     for field, report in reports.items():
-        print(f"\n{'=' * 72}\n字段 {field}（{FIELD_ENCODINGS[field]['name']}）"
+        print(f"\n{'=' * 72}\n字段 {field}（{ALL_FIELDS[field]['name']}）"
               f"｜可用评估日 {report.get('dates_usable', 0)}/{report.get('dates_with_pool', 0)}"
               f"｜事件 {report.get('events_total', 0)} 个｜共用时 {elapsed:.0f}s")
         if not report.get("results"):
@@ -127,7 +130,10 @@ def main() -> int:
         print(f"\n多重检验：{multiplicity['definition']}")
         print(f"  逐检验 |t|≥{multiplicity['per_test_abs_t']}；"
               f"主检验 |t|≥{multiplicity['bonferroni_primary_abs_t']}；"
-              f"全部比较 |t|≥{multiplicity['bonferroni_all_abs_t']}")
+              f"本次全部比较 |t|≥{multiplicity['bonferroni_all_abs_t']}；"
+              f"**含同族此前 {multiplicity['family_prior_statistics']} 条**"
+              f"（共 {multiplicity['family_total_statistics']} 条）|t|≥"
+              f"{multiplicity['bonferroni_family_abs_t']}")
 
         shift = report["placebo"]["date_shift"]
         print(f"\n安慰剂②日期错位（**已判定无效，仅作诊断**）：{shift['draws']} 次平移，"
