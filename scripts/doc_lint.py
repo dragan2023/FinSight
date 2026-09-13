@@ -51,17 +51,36 @@ ALLOWED_MISSING = {
 }
 
 
+def _glob_pattern_regex(pattern: str, *, shorthand: bool = False) -> re.Pattern:
+    """把通配写法转成**不跨目录**的正则：`*` 只匹配一层内的任意字符，`?` 匹配单字符。
+
+    `shorthand=True` 用于"唯一后缀简写"（如 `api/*.py`）：允许**任意前缀目录**
+    （`(?:^|.*/)` 可以跨 `/`），但通配本身仍不跨目录。
+
+    早先的实现只认"开头的 `*`"（`pattern.lstrip("*")` 后做 endswith），
+    于是 `scripts/governance_record_*_change.py`（中间通配，用来指代一族脚本）
+    会被误报成路径不存在——2026-09-14 写接力文档时真的被它拦下。
+    这里改成真正的 glob，但**刻意让 `*` 不跨 `/`**：否则 `api/*.py` 会连
+    `api/sub/x.py` 也算匹配，反而放过写错的路径。
+    """
+    escaped = re.escape(pattern).replace(r"\*", "[^/]*").replace(r"\?", "[^/]")
+    prefix = r"(?:^|.*/)" if shorthand else "^"
+    return re.compile(prefix + escaped + "$")
+
+
 def _resolve(token: str, files: list[str]) -> str:
     """返回 ok / ok_shorthand / missing。简写有多解时视为 ok（都真实存在）。"""
     target = token.rstrip("/")
-    if "*" in target:
-        # 通配符只要求父目录下至少有一个匹配文件（否则 `api/*.py` 会被误报）。
-        parent, _, pattern = target.rpartition("/")
-        matches = [item for item in files
-                   if item.startswith(parent + "/") and item.endswith(pattern.lstrip("*"))]
-        return "ok" if matches else "missing"
     if (ROOT / target).exists():
         return "ok"
+    if "*" in target or "?" in target:
+        rooted = _glob_pattern_regex(target)
+        shorthand = _glob_pattern_regex(target, shorthand=True)
+        rooted_ok = any(rooted.match(item) for item in files)
+        shorthand_ok = any(shorthand.match(item) for item in files)
+        if rooted_ok:
+            return "ok"
+        return "ok_shorthand" if shorthand_ok else "missing"
     suffix = "/" + target
     matches = [item for item in files if item.endswith(suffix) or item == target]
     if matches:
