@@ -55,6 +55,7 @@ from .prompts import (
     TOOL_COLLECTION_RULES,
     content_regen_user,
     format_repair_user,
+    recovery_user,
     section_user,
     tool_collection_user,
 )
@@ -433,37 +434,54 @@ class ResearchGraph:
             return await self._accept_section(template, recovered, state, materials, usage, budget,
                                               context, raw_sections, st, failed_turn.content)
         # 截断且没有完整对象时，不再重写 JSON。保留可解析的完整前缀后，直接让
-        # 模型基于同一材料重写用户可读正文，避免又得到半截 JSON。
+        # 模型基于同一材料重写用户可读正文，避免又得到半截 JSON。恢复失败时必须
+        # 记回"截断"分类：否则 OutputIntegrity.TRUNCATED 永远不可达，前端与说明
+        # 书里的"存在截断章节"状态会变成死码。
+        st["recovery_used"] = True
         return await self._repair_format(template, state, materials, failed_turn, usage, budget,
-                                         context, raw_sections, st)
+                                         context, raw_sections, st, truncated=True)
 
     async def _repair_format(self, template, state, materials, failed_turn: TurnResult,
                              usage: dict, budget: dict, context: ValidationContext,
-                             raw_sections: list, st: dict):
+                             raw_sections: list, st: dict, *, truncated: bool = False):
         section_id = template["id"]
+        note = ("本节输出被截断，自动恢复也未成功；已完成章节保持可用。"
+                if truncated else "本节未能生成可核验的正文，已保留其他章节内容。")
         if st["format_repair_used"] or not can_spend(budget, usage, "llm_requests"):
             raw_sections.append({"id": section_id, "title": template["title"],
-                                 "reason": "unparseable_no_repair", "text": failed_turn.content})
-            st["integrity"] = "unstructured"
-            return self._placeholder(template, "本节未能生成可核验的正文，已保留其他章节内容。"), st["integrity"]
+                                 "reason": "truncated_no_recovery" if truncated else "unparseable_no_repair",
+                                 "text": failed_turn.content})
+            st["integrity"] = "incomplete" if truncated else "unstructured"
+            return self._placeholder(template, note), st["integrity"]
         st["format_repair_used"] = True
         messages = [
             {"role": "system", "content": SECTION_SYSTEM},
-            {"role": "user", "content": format_repair_user(
-                state["question"], state.get("scope") or {}, template, materials,
-                failed_turn.content, "未找到完整的 Markdown 标题")},
+            {"role": "user", "content": (recovery_user(state["question"], state.get("scope") or {},
+                                                        template, materials)
+                                         if truncated else
+                                         format_repair_user(
+                                             state["question"], state.get("scope") or {}, template, materials,
+                                             failed_turn.content, "未找到完整的 Markdown 标题"))},
         ]
         turn = await self._model.turn(messages)
         _spend(usage, "llm_requests")
         usage["reasoning_chars"] += turn.reasoning_chars
         if turn.error is not None or turn.incomplete or not turn.content.strip():
             raw_sections.append({"id": section_id, "title": template["title"],
-                                 "reason": "repair_failed", "text": failed_turn.content})
-            st["integrity"] = "unstructured"
-            return self._placeholder(template, "本节未能生成可核验的正文，已保留其他章节内容。"), st["integrity"]
+                                 "reason": "truncated_after_recovery" if truncated else "repair_failed",
+                                 # 截断恢复的产物本身要留档：它是"恢复输出被作废"的证据，
+                                 # 丢掉它只剩半截原片段就无法复核。
+                                 "text": (turn.content or failed_turn.content) if truncated
+                                         else failed_turn.content})
+            st["integrity"] = "incomplete" if truncated else "unstructured"
+            return self._placeholder(template, note), st["integrity"]
         section, parse_error = self._parse_section(template, turn.content)
         if parse_error is None:
-            st["integrity"] = "markdown_rewritten"
+            # 重写结果本身结构完整并通过校验时不得标成"正文重写"：该标签会让报告
+            # 降级为 partial 并附上"已按可读正文重新生成"的失实说明。截断只使被
+            # 丢弃的那一轮作废，不污染已恢复章节的可核验性。
+            if not truncated:
+                st["integrity"] = "markdown_rewritten"
             return await self._accept_section(template, section, state, materials, usage, budget,
                                               context, raw_sections, st, turn.content)
         # 即使 Markdown 标题再次丢失，只要模型给的是自然语言，仍将其作为本节

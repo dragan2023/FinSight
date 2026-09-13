@@ -25,8 +25,10 @@ from ..strategy.registry import get_spec
 from .ledger import AdvisorLedger, _base_cutoff_date, _now_iso
 from .research_track import ResearchPredictionLedger
 from .evidence import AdvisorEvidenceItem, evidence_index, metric_index
-from .algorithms import (calculate_base_rate, calculate_f_score, calculate_half_kelly,
-                         calculate_scenario_ev, calculate_volatility_target, calculate_z_score)
+from .algorithms import (BASIS_CORPORATE_ACTION_TOTAL_RETURN, BASIS_FORWARD_ADJUSTED_SOURCE,
+                         calculate_base_rate, calculate_f_score, calculate_half_kelly,
+                         calculate_scenario_ev, calculate_volatility_target, calculate_z_score,
+                         total_return_closes)
 from .output_models import EvSummary, SuggestionCard
 from .prompts import (analyst_system, analyst_user, clarifier_system, clarifier_user,
                       debater_system, planner_system, reflector_system, risk_officer_system,
@@ -547,13 +549,15 @@ class AdvisorGraph:
         await asyncio.gather(*tasks)
         if thscode:
             try:
-                base_text, base_available, closes = await self._base_rate_pack(thscode)
+                base_text, base_available, closes, return_closes = await self._base_rate_pack(thscode)
             except (AttributeError, TypeError, ValueError):
                 logger.warning("advisor base rate failed", exc_info=True)
-                base_text, base_available, closes = "历史状态基率暂缺：本机行情仓库不可用。", False, []
+                base_text, base_available, closes, return_closes = (
+                    "历史状态基率暂缺：本机行情仓库不可用。", False, [], [])
             pack.append(_evidence({"id": "A1", "dimension": "algorithm", "title": "历史状态基率",
                                    "text": base_text[:PACK_CHARS], "thscode": thscode,
-                                   "base_rate_available": base_available, "algorithm_data": {"closes": closes},
+                                   "base_rate_available": base_available,
+                                   "algorithm_data": {"closes": closes, "return_closes": return_closes},
                                    "metrics": _base_rate_metrics(base_text, base_available),
                                    "sources": [{"kind": "market",
                                                 "label": "同花顺历史日 K / 本机行情仓库：20 日动量 × 波动状态历史基率"}]}))
@@ -566,7 +570,7 @@ class AdvisorGraph:
             strategy_knowledge = await self._strategy_knowledge_pack(
                 thscode, question=question,
                 strategy_ids=[item["strategy_id"] for item in candidate_experiments],
-                horizon=horizon, market_regime=_infer_market_regime(closes))
+                horizon=horizon, market_regime=_infer_market_regime(return_closes or closes))
             if strategy_knowledge is not None:
                 pack.append(strategy_knowledge)
         return pack
@@ -611,42 +615,67 @@ class AdvisorGraph:
         return ("\n".join(lines) if lines else "基本面数据暂缺。",
                 [{"kind": "market", "label": "同花顺 F10：年报三表、主要指标与估值"}], metrics)
 
-    async def _base_rate_pack(self, thscode: str) -> tuple[str, bool, list[float]]:
-        end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        rows = []
+    async def _base_rate_pack(self, thscode: str) -> tuple[str, bool, list[float], list[float]]:
+        """返回 (说明文字, 基率是否可用, 价格水平序列, 总收益口径序列)。
+
+        第一个序列是未复权/前复权收盘价，供当前价与情景 EV 使用；第二个序列
+        是公司行动总收益指数，供状态基率、波动率与市场状态标签使用。除权日
+        在未复权价上会机械性下跌，用错序列会把真实正收益记成负收益。
+        """
+        as_of_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        rows: list[dict] = []
+        return_rows: list[dict] = []
+        price_basis = BASIS_CORPORATE_ACTION_TOTAL_RETURN
         if self._warehouse is not None:
-            rows = await asyncio.to_thread(self._warehouse.repository.history, thscode, 0, end_ms)
+            # ex_date_ms 必须在仓库查询层就被 as-of 截断：adjustment_factors
+            # 里含已公告但尚未发生的未来除权日，越过 as-of 即未来信息泄漏。
+            history = await asyncio.to_thread(
+                self._warehouse.repository.corporate_action_total_return_history,
+                thscode, 0, as_of_ms)
+            converted = total_return_closes(history.get("items") or [], as_of_ms=as_of_ms)
+            rows = converted["raw_closes"]
+            return_rows = converted["closes"]
         # 全市场仓库尚未同步时，直接回退到同花顺该标的历史日 K；不能让一个
         # 可选的批量仓库成为单标的顾问分析的硬阻塞点。
         if len(rows) < 81 and self._market is not None:
             history = await self._market.fetch_price_history(
-                thscode, start_ms=end_ms - 6 * 366 * 86_400_000, end_ms=end_ms)
+                thscode, start_ms=as_of_ms - 6 * 366 * 86_400_000, end_ms=as_of_ms)
             rows = _base_rate_rows(getattr(history, "records", []) or [])
+            # 数据源返回的已是前复权序列，不需要（也无法）再叠加公司行动。
+            return_rows = []
+            price_basis = BASIS_FORWARD_ADJUSTED_SOURCE
         if not rows:
-            return "历史状态基率暂缺：同花顺历史日 K 与本机行情仓库均无可用记录。", False, []
-        result = calculate_base_rate(rows)
+            return ("历史状态基率暂缺：同花顺历史日 K 与本机行情仓库均无可用记录。",
+                    False, [], [])
+        result = calculate_base_rate(rows, return_rows=return_rows or None,
+                                     price_basis=price_basis, as_of_ms=as_of_ms)
         forward_20 = result["forward_20"]
         forward_60 = result["forward_60"]
         closes = [float(row["close_price"]) for row in rows]
+        return_closes = [float(row["close_price"]) for row in (return_rows or rows)]
         if not result["available"]:
             return (f"历史状态基率不可用：20 日样本数 {forward_20['sample_count']}，少于 30；{result['note']}",
-                    False, closes)
+                    False, closes, return_closes)
         text = (f"历史状态基率（{result['state_label']}）：后续 20 日样本 {forward_20['sample_count']}，"
                 f"中位收益 {forward_20['median_return_pct']}%，胜率 {forward_20['win_rate'] * 100:.1f}%；"
                 f"后续 60 日样本 {forward_60['sample_count']}，中位收益 {forward_60['median_return_pct']}%，"
                 f"胜率 {forward_60['win_rate'] * 100:.1f}%。{result['note']}")
-        return text, True, closes
+        return text, True, closes, return_closes
 
     def _enrich_card(self, card: SuggestionCard, pack: list[dict],
                      *, conflicts: list[str] | None = None) -> SuggestionCard:
         algorithm = next((item.get("algorithm_data", {}) for item in pack if item.get("id") == "A1"), {})
         closes = algorithm.get("closes", [])
+        # 收益类计算一律用公司行动总收益口径：未复权价在除权日会机械性下跌，
+        # 用错序列会同时污染基率胜率与波动率目标仓位。价格水平类计算（情景 EV
+        # 的当前价）仍用原始收盘价。
+        return_closes = algorithm.get("return_closes") or closes
         ev = calculate_scenario_ev([scenario.model_dump() for scenario in card.scenarios],
                                    current_price=closes[-1] if closes else None)
-        position = calculate_volatility_target(closes)
+        position = calculate_volatility_target(return_closes)
         base = next((item for item in pack if item.get("id") == "A1"), {})
         base_details = calculate_base_rate([{"date_ms": index + 1, "close_price": close}
-                                            for index, close in enumerate(closes)]) if closes else {}
+                                            for index, close in enumerate(return_closes)]) if return_closes else {}
         distribution = base_details.get("forward_20", {})
         kelly = calculate_half_kelly(
             probability_source="base_rate" if base.get("base_rate_available") else "subjective",
