@@ -99,6 +99,43 @@ FIELDS = (
 
 SCAN_REFERENCE = "limit_up_event_study_design@v1"
 
+#: 首次执行后登记的**设计修正**。按方案 A.1「登记后不得改名或改定义——变更视为新条目」，
+#: 所以不是去改 @v1，而是新开 @v2。
+DESIGN_V2_REFERENCE = "limit_up_event_study_design@v2"
+DESIGN_V2 = {
+    "supersedes": SCAN_REFERENCE,
+    "what_changed": "安慰剂②（日期错位）由『零分布』降级为**诊断**，不再充当显著性参照；"
+                    "允许的稳健性检验改为：① 同日同十分位对照置换（唯一显著性参照）；"
+                    "② **同日同池的相对比较**（同为涨停股、同一天、同一套对照）。",
+    "why": "首次执行实测：日期错位的 |t| 95 分位 = **9.76**（200 次平移），而『真零分布下应≈1.96』。"
+           "把它改成与主统计量同一个配对估计量后**几乎没有变化**（第一版 10.08），"
+           "所以根因不是基准不一致，而是两条设计缺陷："
+           "① 位移为正时等于**用未来的涨停名单去度量今天的收益**（前视选择），"
+           "『未来会涨停』与今天的收益本来就相关，超额不再≈0；"
+           "② 固定位移使相邻交易日的池子高度重叠（连板股连续上榜）+ 市场状态持续 → "
+           "逐日超额**强自相关**，而 t 值假设逐日独立 → |t| 被系统性放大。",
+    "consequence": "『涨停后 20 日整体跑输同档对照约 1%』**不得**表述为涨停事件的效应："
+                   "日期错位诊断显示非事件队列的同档超额也不为 0，"
+                   "即**成交额十分位匹配没有中和标的类型差异**，本设计无法分离"
+                   "『涨停事件』与『这类标的』。"
+                   "而池内相对比较（连板高 vs 低、封单高 vs 低）对标的类型混淆免疫，"
+                   "这两条结论保留。",
+    "required_next": "后续稳健性检验必须改用：① 池内子样本相对比较；或 ② 按**事前**特征"
+                     "（事件前波动率/前期收益/行业）匹配或加权的对照。"
+                     "**禁止**通过调整位移范围或换基准把日期错位『调到≈0』。",
+    "measured": {
+        "permutation_null_abs_t_p95": {"continue_day_cnt": {"high": 1.852, "low": 1.991,
+                                                            "diff": 1.740},
+                                        "seal_money": {"high": 1.786, "low": 1.976,
+                                                       "diff": 1.994}},
+        "date_shift_abs_t_p95": 9.755396,
+        "real_t": {"continue_day_cnt": {"high": -3.019, "low": -6.107, "diff": -0.370},
+                   "seal_money": {"high": -0.068, "low": -10.921, "diff": 8.234}},
+    },
+    "note_on_significance": "六个对照置换零分布的 |t| 95 分位落在 1.74–1.99，与声明值 1.96 一致 "
+                            "→ 重抽机制构造正确，real_t 与它的比较有效。",
+}
+
 
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
@@ -143,6 +180,20 @@ def main() -> int:
             direction="无方向（设计登记）", exploratory=True, trial_count=len(FIELDS),
             notes="把「先声明设计、再评价」这件事本身落成台账条目：即使三个字段将来一个都没过，"
                   "也能回答『当时承诺用的是什么设计、什么门槛』。")
+
+    batch_id = governance.current_batch_id()
+    if DESIGN_V2_REFERENCE in existing:
+        plan.append(f"skip  {DESIGN_V2_REFERENCE}（已登记）")
+    else:
+        plan.append(f"add   {DESIGN_V2_REFERENCE}（kind=scan, 设计修正）")
+    if DESIGN_V2_REFERENCE not in existing and not args.dry_run:
+        governance.register_hypothesis(
+            kind="scan", name="涨停池事件研究设计修正（安慰剂②降级为诊断）",
+            reference=DESIGN_V2_REFERENCE,
+            definition={**DOMAIN, **DESIGN_V2}, direction="无方向（设计修正登记）",
+            exploratory=True, trial_count=len(FIELDS),
+            notes="首次执行后发现日期错位安慰剂无效（§why），按 A.1 新开 reference 而不是改 @v1。"
+                  "**没有**为了让安慰剂好看而改主统计量：主统计量定义未动（有测试钉住）。")
 
     batch_id = governance.current_batch_id()
     if batch_id and not args.dry_run:
