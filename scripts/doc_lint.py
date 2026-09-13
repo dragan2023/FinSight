@@ -143,6 +143,32 @@ def check_timeouts() -> list[str]:
     return violations
 
 
+def check_navigation() -> list[str]:
+    """说明书的左侧导航清单必须与 `Layout/index.tsx` 的 NavLink **逐项同序**。
+
+    加这一项的原因很直接：批次 7 新增了「治理与落盘」导航项，说明书里的
+    「共 15 项」当场失准——而前两项检查（路径 / 版本 / 常量）都抓不到这种漂移。
+    """
+    layout = ROOT / "frontend" / "src" / "components" / "Layout" / "index.tsx"
+    manual = ROOT / "docs" / "FinSight使用说明书.md"
+    if not layout.exists() or not manual.exists():
+        return []
+    labels = [label.strip() for label in re.findall(
+        r"aria-hidden\s*/>\s*([^<\n]+?)\s*</NavLink>",
+        layout.read_text(encoding="utf-8"), re.S) if label.strip()]
+    text = manual.read_text(encoding="utf-8")
+    match = re.search(r"左侧导航从上到下依次是：(.+?)（共", text, re.S)
+    if not match:
+        return ["FinSight使用说明书.md 里找不到「左侧导航从上到下依次是：…（共 N 项」句式，"
+                "无法核对导航清单"]
+    documented = [item.strip() for item in
+                  match.group(1).replace("\n", "").split("、") if item.strip()]
+    if documented == labels:
+        return []
+    return [f"说明书导航清单与实际不一致：文档 {len(documented)} 项、代码 {len(labels)} 项；"
+            f"文档={documented}；代码={labels}"]
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -162,11 +188,12 @@ def main() -> int:
     path_violations, checked, shorthand = check_paths(markdown, files)
     version_violations = check_versions()
     timeout_violations = check_timeouts()
+    navigation_violations = check_navigation()
 
     print(f"扫描 {len(markdown)} 份 Markdown，检查 {checked} 条路径引用"
           f"（其中 {shorthand} 条为唯一后缀简写，已解析通过）")
     sections = (("路径", path_violations), ("版本号", version_violations),
-                ("常量", timeout_violations))
+                ("常量", timeout_violations), ("导航清单", navigation_violations))
     total = 0
     for label, items in sections:
         total += len(items)

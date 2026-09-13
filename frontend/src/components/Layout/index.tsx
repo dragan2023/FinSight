@@ -7,6 +7,7 @@ import {
   MessageOutlined,
   NotificationOutlined,
   SafetyCertificateOutlined,
+  SafetyOutlined,
   SettingOutlined,
 } from "@ant-design/icons";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
@@ -57,6 +58,7 @@ export default function Layout() {
           <NavLink to="/market-explorer" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><FundOutlined aria-hidden />全市场观察</NavLink>
           <NavLink to="/news" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><NotificationOutlined aria-hidden />新闻订阅</NavLink>
           <NavLink to="/knowledge" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><BookOutlined aria-hidden />知识库</NavLink>
+          <NavLink to="/governance" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}><SafetyOutlined aria-hidden />治理与落盘</NavLink>
           <NavLink
             to="/settings"
             className={({ isActive }) =>

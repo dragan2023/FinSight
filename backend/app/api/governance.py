@@ -5,11 +5,20 @@
 治理的价值就在这些拒绝里，加一个绕过它的端点等于把治理作废。
 """
 from fastapi import APIRouter, Query, Request
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..governance.models import (BatchInput, BatchVerdictInput, ChangeInput, CombinedStatisticsInput,
                                  HypothesisInput, MemberInput)
+from ..governance.test_run_export import DailyExportService
 
 router = APIRouter(prefix="/api/governance", tags=["governance"])
+
+
+class TestRunExportInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    batch_id: str | None = Field(default=None, max_length=64)
 
 
 def service(request: Request):
@@ -102,3 +111,21 @@ def record_change(data: ChangeInput, request: Request):
         field=data.field, reason=data.reason, old_hash=data.old_hash, new_hash=data.new_hash,
         hypothesis_id=data.hypothesis_id, replacement_id=data.replacement_id,
         new_batch_name=data.new_batch_name, plan=data.plan, stop_criteria=data.stop_criteria)
+
+
+# -- 当日测试数据落盘（方案 00 §5）------------------------------------------
+def export_service(request: Request) -> DailyExportService:
+    """**只能由用户点击触发。** 这里不注册任何定时任务，导出也不在取数路径里被调用。"""
+    return DailyExportService(request.app.state.storage, request.app.state.settings.exports_path)
+
+
+@router.get("/test-run-exports")
+def list_test_run_exports(request: Request):
+    return {"runs": export_service(request).list_runs(),
+            "note": "导出由用户在界面点击触发；本接口也是只读。"}
+
+
+@router.post("/test-run-export", status_code=201)
+def create_test_run_export(data: TestRunExportInput, request: Request):
+    """把当日（或指定批次）的测试数据落盘为 daily.md / daily.jsonl / batch.json。"""
+    return export_service(request).export(date=data.date, batch_id=data.batch_id)

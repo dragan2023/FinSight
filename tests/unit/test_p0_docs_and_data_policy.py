@@ -40,11 +40,13 @@ def test_documentation_paths_versions_and_constants_are_consistent(monkeypatch):
     violations, checked, _ = doc_lint.check_paths(markdown, files)
     versions = doc_lint.check_versions()
     constants = doc_lint.check_timeouts()
+    navigation = doc_lint.check_navigation()
 
     assert checked > 40, "路径检查数量异常偏低，扫描逻辑可能坏了"
     assert violations == [], f"文档引用了不存在的路径：{violations[:5]}"
     assert versions == [], f"方法卡版本与 registry 不一致：{versions}"
     assert constants == [], f"说明书常量与代码不一致：{constants}"
+    assert navigation == [], f"说明书导航清单与前端不一致：{navigation}"
 
 
 # --- 2) 只读冻结数据集 -----------------------------------------------------

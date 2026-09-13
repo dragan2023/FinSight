@@ -17,6 +17,7 @@ const AIChat = lazy(() => import("./pages/AIChat"));
 const News = lazy(() => import("./pages/News"));
 const Knowledge = lazy(() => import("./pages/Knowledge"));
 const StrategyLab = lazy(() => import("./pages/StrategyLab"));
+const Governance = lazy(() => import("./pages/Governance"));
 
 export default function App() {
   return (
@@ -61,6 +62,7 @@ export default function App() {
             <Route path="news" element={<Suspense fallback={<Skeleton active />}><News /></Suspense>} />
             <Route path="knowledge" element={<Suspense fallback={<Skeleton active />}><Knowledge /></Suspense>} />
             <Route path="strategy-lab" element={<Suspense fallback={<Skeleton active />}><StrategyLab /></Suspense>} />
+            <Route path="governance" element={<Suspense fallback={<Skeleton active />}><Governance /></Suspense>} />
             <Route
               path="settings"
               element={
