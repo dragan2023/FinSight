@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from ..errors import AppError
 from .download import download_parquet
 from .repository import WarehouseRepository
-from .schema import SCHEMA_VERSION
+from .schema import FROZEN_READONLY_DATASETS, LEGACY_DATASETS, SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from fastapi import UploadFile
@@ -30,6 +30,80 @@ class MarketWarehouseService:
 
     def status(self):
         return self.repository.status()
+
+    # --- 数据集口径登记（P0-4.1 / P0-4.2，决策 D9 / D10）----------------------
+    def dataset_registry(self) -> dict:
+        """把**代码侧声明的**数据集口径与 `market_datasets` 的**实际记录**并列。
+
+        存在的意义：让"这个数据集可不可信、能不能增量更新、版本对不对"变成一个
+        可查询的事实，而不是散落在几份文档里的推论。
+        """
+        with self.storage.connect() as db:
+            rows = [dict(row) for row in db.execute(
+                "SELECT id,kind,version,row_count,min_date_ms,max_date_ms,schema_version,"
+                "status,created_at FROM market_datasets ORDER BY kind").fetchall()]
+            run_count = db.execute("SELECT count(*) FROM market_sync_runs").fetchone()[0]
+        registered = {row["kind"] for row in rows}
+        problems: list[str] = []
+        for row in rows:
+            if row["schema_version"] != SCHEMA_VERSION:
+                problems.append(f"{row['kind']} 的 schema_version={row['schema_version']} "
+                                f"落后于当前常量 {SCHEMA_VERSION}")
+            if row["kind"] in LEGACY_DATASETS:
+                problems.append(f"{row['kind']} 登记为 legacy：{LEGACY_DATASETS[row['kind']]}")
+        if run_count == 0:
+            problems.append("market_sync_runs 为 0 行：现有数据集不可能来自正常导入流程")
+        missing = [kind for kind in FROZEN_READONLY_DATASETS if kind not in registered]
+        return {
+            "current_schema_version": SCHEMA_VERSION,
+            "datasets": rows,
+            "sync_run_count": run_count,
+            "frozen_readonly": FROZEN_READONLY_DATASETS,
+            "legacy": LEGACY_DATASETS,
+            "unregistered_frozen": missing,
+            "problems": problems,
+            "usable_for_recommendation": False,
+            "note": "本机行情仓库仅可作为低换手横截面策略的研究数据前提，不代表策略有效；"
+                    "且不含退市证券，历史统计乐观偏置（见 docs/荐股治理方案/07 §4.1）。",
+        }
+
+    def register_legacy_datasets(self) -> dict:
+        """把 D9/D10 的口径**写进数据库**（幂等）。
+
+        - 已存在的 legacy 数据集：`status` 改为 `legacy`，并在 `quality_json` 里带上原因；
+        - `financial_statements` 在 `market_datasets` 里**原本没有任何登记行**，
+          这里补一行只读快照登记，让它出现在数据集清单里。
+
+        刻意**不重跑全量同步**（D10）：重新拉取 5000+ 标的的全部历史耗时且无正确性收益。
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        updated: list[str] = []
+        with self.storage.connect() as db:
+            for row in db.execute("SELECT id, kind, quality_json FROM market_datasets").fetchall():
+                if row["kind"] not in LEGACY_DATASETS:
+                    continue
+                quality = json.loads(row["quality_json"] or "{}")
+                quality["legacy"] = {"reason": LEGACY_DATASETS[row["kind"]],
+                                     "decision": "D10（01 号文档 P0-4.2：登记为 legacy，不重跑同步）",
+                                     "registered_at": now}
+                db.execute("UPDATE market_datasets SET status='legacy', quality_json=? WHERE id=?",
+                           (json.dumps(quality, ensure_ascii=False, sort_keys=True), row["id"]))
+                updated.append(row["kind"])
+            for kind, detail in FROZEN_READONLY_DATASETS.items():
+                exists = db.execute("SELECT 1 FROM market_datasets WHERE kind=?", (kind,)).fetchone()
+                if exists:
+                    continue
+                quality = {"kind": kind, "read_only": True, "registration": detail,
+                           "registered_at": now}
+                db.execute(
+                    "INSERT INTO market_datasets(id,kind,version,row_count,min_date_ms,max_date_ms,"
+                    "sha256,schema_version,status,quality_json,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (uuid.uuid4().hex, kind, "frozen", 0, None, None, "",
+                     SCHEMA_VERSION, "legacy_frozen_readonly",
+                     json.dumps(quality, ensure_ascii=False, sort_keys=True), now))
+                updated.append(kind)
+        return {"updated": updated, "registry": self.dataset_registry()}
 
     def _create_run(self, kind: str) -> str:
         run_id = uuid.uuid4().hex

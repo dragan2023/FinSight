@@ -2,7 +2,7 @@
 from __future__ import annotations
 from pathlib import Path
 import duckdb
-from .schema import ADJUSTMENT_FACTOR_COLUMNS, DAILY_COLUMNS
+from .schema import ADJUSTMENT_FACTOR_COLUMNS, DAILY_COLUMNS, FROZEN_READONLY_DATASETS
 
 
 class WarehouseRepository:
@@ -41,6 +41,12 @@ class WarehouseRepository:
     def validate_parquet(self, file: Path, *, kind: str = "daily_k") -> dict:
         if kind == "adjustment_factors":
             return self.validate_adjustment_factors_parquet(file)
+        if kind in FROZEN_READONLY_DATASETS:
+            # P0-4.1 / D9：只读冻结数据集不接受导入校验——把"禁止增量更新"从文档
+            # 提升为会抛错的代码路径，而不是靠读者记得。
+            detail = FROZEN_READONLY_DATASETS[kind]
+            raise ValueError(f"{kind} 是只读冻结数据集（{detail['decision']}）。"
+                             f"{detail['forbidden']}。原因：{detail['reason']}")
         if kind not in {"daily_k", "daily_k_10d", "daily_k_import"}:
             raise ValueError("不支持的全市场数据集类型。")
         db = self._connect()
@@ -269,6 +275,18 @@ class WarehouseRepository:
             elif events:
                 invalid_factor_count += events
             items.append(item)
+        # P0-4.3：把 docstring 里的「不得越过 as-of」从文字提升为**可执行断言**。
+        # SQL 已用 date_ms<=end_ms 与 ex_date_ms<=end_ms 约束；这里是最后一道自检：
+        # 一旦有人改了查询而忘了同步这两处，必须在这里炸掉，而不是静默泄漏未来信息。
+        beyond = [item["date_ms"] for item in items if item["date_ms"] > end_ms]
+        if beyond:
+            raise ValueError(
+                f"内部错误：{thscode} 返回了 as-of（{end_ms}）之后的行情行 {beyond[:3]}——"
+                "复权序列越过评估时点即为未来信息泄漏。")
+        late_events = [ms for ms in unmatched_event_dates if ms > end_ms]
+        if late_events:
+            raise ValueError(
+                f"内部错误：{thscode} 的未匹配除权事件越过了 as-of（{end_ms}）：{late_events[:3]}。")
         return {"basis": "corporate_action_total_return_v1", "items": items,
                 "applied_event_count": applied_event_count, "unmatched_event_count": len(unmatched_event_dates),
                 "unmatched_event_dates": unmatched_event_dates,

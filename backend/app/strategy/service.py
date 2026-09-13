@@ -51,7 +51,11 @@ class StrategyService:
   raw=run_backtest(data.strategy_id,bars,data.one_way_cost_bps,gate=gate); main=metrics(raw["curve"],raw["trades"]); seg=segments(data.strategy_id,bars,data.one_way_cost_bps,gate=gate); cost=[]
   for bps in (5,10,20):
    item=run_backtest(data.strategy_id,bars,bps,gate=gate); cost.append({"one_way_cost_bps":bps,**metrics(item["curve"],item["trades"])})
-  grade_value,reasons=grade(bars=len(bars),segments=seg,cost20_test=cost[-1],test=seg[-1])
+  # F15 修正（已走 record_change）：门禁的「20bps 下不亏」必须看**测试段**，不是全周期。
+  # 参数名 cost20_test 本就写明了该意图；此前传的是 cost[-1]（全周期指标），
+  # 于是「测试段为正、全周期为负」的好实验会被误判为不合格。
+  cost20_test=segments(data.strategy_id,bars,20,gate=gate)[-1]
+  grade_value,reasons=grade(bars=len(bars),segments=seg,cost20_test=cost20_test,test=seg[-1])
   output=StrategyExperimentResult(spec_snapshot=spec.model_dump(),data_snapshot=snapshot,metrics=main,segment_metrics=seg,cost_sensitivity=cost,validation_grade=grade_value,validation_reasons=reasons,curve=raw["curve"],trades=raw["trades"],year_metrics=year_segments(raw["curve"],raw["trades"]),signal_snapshot=current_signal_snapshot(data.strategy_id,bars,gate=gate))
   if len(raw["trades"])>1000: raise AppError("strategy_invalid","交易数超过上限，拒绝保存。",422)
   payload=output.model_dump()
