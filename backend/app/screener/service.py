@@ -47,6 +47,17 @@ def _day(date_ms: int) -> str:
     return datetime.fromtimestamp(date_ms / 1000, CST).strftime("%Y-%m-%d")
 
 
+def total_return(row: dict) -> float:
+    """结算侧窗口总收益：`(close_h × (1+送股+配股) + 分红 − 配股成本) / close_T − 1`。
+
+    提成模块级函数是为了让事件研究（`screener/events.py`）与横截面 IC **共用同一个口径**——
+    两处各写一遍迟早会漂移，而"总收益到底怎么算"是这套评价的地基。
+    """
+    base = row["close_t"]
+    return ((row["horizon_close"] * (1 + row.get("bonus", 0.0)) + row.get("dividend", 0.0)
+             - row.get("rights_cost", 0.0)) / base - 1) if base else 0.0
+
+
 def _to_ms(date_str: str) -> int:
     return int(datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=CST).timestamp() * 1000)
 
@@ -347,10 +358,8 @@ class ScreenerService:
 
     @staticmethod
     def _total_return(row: dict) -> float:
-        """窗口总收益：`(close_h × (1+送股+配股) + 分红 − 配股成本) / close_T − 1`。"""
-        base = row["close_t"]
-        return ((row["horizon_close"] * (1 + row.get("bonus", 0.0)) + row.get("dividend", 0.0)
-                 - row.get("rights_cost", 0.0)) / base - 1) if base else 0.0
+        """窗口总收益（口径见模块级 `total_return`，两者是同一个实现）。"""
+        return total_return(row)
 
     def ic_report(self, dates: list[int], *, horizon_days: int = 20,
                   rules: UniverseRules | None = None,

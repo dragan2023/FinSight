@@ -23,7 +23,7 @@ import duckdb  # noqa: E402
 from backend.app.market_warehouse.repository import WarehouseRepository  # noqa: E402
 from backend.app.screener import ScreenerService, UniverseRules  # noqa: E402
 from backend.app.screener.universe import (BASIS_LIMIT_UP_PROXY,  # noqa: E402
-                                           BASIS_REAL_LIMIT_UP_POOL)
+                                           BASIS_REAL_LIMIT_UP_POOL, LIMIT_UP_SOURCES)
 from backend.app.settings import load_settings  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
@@ -60,6 +60,10 @@ def main() -> int:
     parser.add_argument("--top", type=int, default=200, help="候选池输出条数（0=全部）")
     parser.add_argument("--draws", type=int, default=200, help="安慰剂重排次数")
     parser.add_argument("--min-turnover", type=float, default=2.0e7)
+    parser.add_argument("--limit-up-source", default="real_pool_preferred",
+                        choices=list(LIMIT_UP_SOURCES),
+                        help="涨停剔除口径。proxy_only 是**对照口径**，只用于度量规则变更的"
+                             "影响，不作为默认")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
@@ -67,7 +71,8 @@ def main() -> int:
     db_path = settings.market_warehouse_path
     repository = WarehouseRepository(db_path)
     service = ScreenerService(repository)
-    rules = UniverseRules(min_turnover_20d=args.min_turnover)
+    rules = UniverseRules(min_turnover_20d=args.min_turnover,
+                          limit_up_source=args.limit_up_source)
 
     days = _trading_days(db_path)
     if not days:
