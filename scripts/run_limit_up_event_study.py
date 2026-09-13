@@ -106,9 +106,33 @@ def main() -> int:
         for key, stat in report["placebo"]["permutation"]["by_group"].items():
             print(f"  {key:<16}real_t={stat['real_t']}  t均值={stat['t_mean']}  "
                   f"|t|95分位={stat['t_abs_p95']}")
+
+        # --- 稳健性变体矩阵（v3 预注册清单；主检验 = base_all 的『高−低』）---
+        print(f"\n变体矩阵（每个变体的『高−低』都有**自己的零分布**）：")
+        print(f"{'变体':<20}{'对照匹配':<30}{'事件':>7}{'高组':>11}{'低组':>11}"
+              f"{'高−低':>11}{'t值':>8}{'零分布95':>10}")
+        for name, payload in report["variants"].items():
+            diff = payload["results"]["high_minus_low"]
+            null = payload["placebo"]["by_group"]["high_minus_low"]["t_abs_p95"]
+            print(f"{name:<20}{payload['matching']:<30}{payload['events']:>7}"
+                  f"{payload['results']['high']['mean_excess']:>11}"
+                  f"{payload['results']['low']['mean_excess']:>11}"
+                  f"{diff['mean_excess']:>11}{str(diff['t_stat']):>8}{str(null):>10}")
+        if report["by_period"]:
+            print(f"\n分时段复现（『高−低』）：")
+            for key, item in report["by_period"].items():
+                print(f"  {key:<34}{item['dates']:>5} 天  超额 {item['mean_excess']:>10}"
+                      f"  t={item['t_stat']}")
+        multiplicity = report["multiplicity"]
+        print(f"\n多重检验：{multiplicity['definition']}")
+        print(f"  逐检验 |t|≥{multiplicity['per_test_abs_t']}；"
+              f"主检验 |t|≥{multiplicity['bonferroni_primary_abs_t']}；"
+              f"全部比较 |t|≥{multiplicity['bonferroni_all_abs_t']}")
+
         shift = report["placebo"]["date_shift"]
-        print(f"安慰剂②日期错位（同为配对估计量）：{shift['draws']} 次平移，"
-              f"t 均值 {shift['t_mean']}，|t| 95 分位 {shift['t_abs_p95']}")
+        print(f"\n安慰剂②日期错位（**已判定无效，仅作诊断**）：{shift['draws']} 次平移，"
+              f"|t| 95 分位 {shift['t_abs_p95']}")
+        print(f"  {shift['diagnostic_value']}")
         print(f"\n{report['significance']}")
         for value in report["limitations"]:
             print(f"  ⚠ {value}")

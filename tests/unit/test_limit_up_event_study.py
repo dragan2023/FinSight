@@ -20,16 +20,18 @@ from backend.app.market_warehouse.repository import WarehouseRepository
 from backend.app.screener.events import FIELD_ENCODINGS, LimitUpEventStudy, _t_stat
 
 DAY_MS = 86_400_000
-EVENT_DAY = DAY_MS * 22
+#: 事件日排在第 70 根 K 线：**事前 40 日动量需要 `close_60_ago`（第 61 根）**，
+#: 事件日必须晚于它，否则"事前特征匹配"变体会静默退化成 base（早期夹具就是这样）。
+EVENT_DAY = DAY_MS * 70
 SYMBOLS = [f"{index:06d}.SZ" for index in range(30)]
 #: 涨停的 6 只**故意分散在不同成交额十分位**（对照必须落在同一十分位；若全落在最低那一档，
 #: 该档里没有非涨停标的，事件会被如实跳过 → 一天都用不了）。
 POOL = [SYMBOLS[index] for index in (1, 6, 11, 16, 21, 26)]
 CONTINUE_DAYS = [1, 1, 1, 2, 2, 3]
 SEAL_MONEY = [1.0e6, 2.0e6, 3.0e6, 4.0e6, 5.0e6, 6.0e6]
-#: 30 只 × 30 根 = 900 行。**不能再多**：实测本机 DuckDB 参数化插入约 2–7 毫秒/行
-#: （2400 行要 6.8–17 秒，内存库也一样），夹具大一倍就慢一倍。
-BARS = 30
+#: 30 只 × 80 根 = 2400 行。**不能再多**：实测本机 DuckDB 参数化插入约 2–7 毫秒/行。
+#: 80 根是**事前特征匹配的下限**：`close_60_ago` 需要第 61 根，事件日必须排在它之后。
+BARS = 80
 
 
 def _fixture(repository) -> None:
@@ -205,6 +207,87 @@ def test_date_shift_placebo_does_detect_a_shifted_cohort_that_really_differs(rep
     shift = study._date_shift_placebo(per_date, dates, draws=10, seed=3)
     assert shift["draws"] > 0
     assert shift["t_abs_p95"] is not None and shift["t_abs_p95"] > 1.96
+
+
+# --- v2 稳健性变体：池内分层 + 事前特征匹配 + 多重检验门槛 -----------------
+
+def test_strata_restrict_events_to_the_declared_subsample(repository):
+    """池内分层必须**真的**只取那一段子样本——否则"稳健性检验"是假的。
+
+    夹具：首板 3 只（封单 1/2/3 百万）、连板 3 只（封单 4/5/6 百万），
+    池内封单中位数 = 4 百万。
+    """
+    study = LimitUpEventStudy(repository)
+    report = study.run(field="seal_money", horizon_days=5, draws=3)
+    variants = report["variants"]
+
+    # 按连板结构分层：首板全是低封单，连板里 2 高 1 低
+    assert variants["base_first_board"]["results"]["high"]["events"] == 0
+    assert variants["base_first_board"]["results"]["low"]["events"] == 3
+    assert variants["base_multi_board"]["results"]["high"]["events"] == 2
+    assert variants["base_multi_board"]["results"]["low"]["events"] == 1
+    # 按封单结构分层看连板：高封单那层只有连板，低封单那层 3 首板 + 1 连板
+    other = study.run(field="continue_day_cnt", horizon_days=5, draws=3)["variants"]
+    assert other["base_high_seal"]["results"]["high"]["events"] == 2
+    assert other["base_high_seal"]["results"]["low"]["events"] == 0
+    assert other["base_low_seal"]["results"]["high"]["events"] == 1
+    assert other["base_low_seal"]["results"]["low"]["events"] == 3
+    # 分层后的样本量必须小于 all 层
+    assert variants["base_all"]["events"] > variants["base_multi_board"]["events"]
+
+
+def test_matched_variant_really_uses_a_finer_control_grid(repository):
+    """事前特征匹配必须**真的**把对照切得更细，而不是换个名字。
+
+    细网格 = 成交额十分位 × 事前 40 日动量三分位。若事件日排在 `close_60_ago` 之前，
+    动量全是空 → 细网格退化成粗网格，这条测试就会失败（这正是它要防的）。
+    """
+    study = LimitUpEventStudy(repository)
+    detail = study._study_date(EVENT_DAY, {symbol: {"thscode": symbol,
+                                                    "continue_day_cnt": CONTINUE_DAYS[index],
+                                                    "seal_money": SEAL_MONEY[index]}
+                                           for index, symbol in enumerate(POOL)},
+                               horizon_days=5, fields=("seal_money",), draws=3,
+                               rng=__import__("random").Random(5), pool_union=set(POOL))
+    detail = detail["seal_money"]
+    assert detail["control_buckets"] > 0
+    assert detail["control_cells_matched"] > detail["control_buckets"], \
+        "事前动量三分位没有生效：细网格必须比粗网格更细"
+    assert detail["variants"]["matched_all"]["events_used"] > 0
+
+
+def test_variant_results_and_nulls_are_reported_for_every_variant(repository):
+    report = LimitUpEventStudy(repository).run(field="seal_money", horizon_days=5, draws=3)
+    names = sorted(report["variants"])
+    assert names == ["base_all", "base_first_board", "base_multi_board", "matched_all"]
+    for name, payload in report["variants"].items():
+        assert set(payload["results"]) == {"high", "low", "high_minus_low"}
+        assert set(payload["placebo"]["by_group"]) == {"high", "low", "high_minus_low"}
+        for stat in payload["placebo"]["by_group"].values():
+            assert "real_t" in stat and "t_abs_p95" in stat and "t_draws" in stat
+    # 兼容：顶层 results / placebo 指向 base_all
+    assert report["results"] == report["variants"]["base_all"]["results"]
+
+
+def test_multiplicity_counts_every_comparison_it_reports(repository):
+    """按方案 A.2，计数必须包含**全部看过的**比较；门槛随计数变严。"""
+    report = LimitUpEventStudy(repository).run(field="seal_money", horizon_days=5, draws=3)
+    multiplicity = report["multiplicity"]
+    expected = len(report["variants"]) * 3 + len(report["by_period"])
+    assert multiplicity["statistics_tested"] == expected
+    assert multiplicity["per_test_abs_t"] == 1.96
+    assert multiplicity["bonferroni_primary_abs_t"] > 1.96
+    assert multiplicity["bonferroni_all_abs_t"] > multiplicity["bonferroni_primary_abs_t"]
+    assert str(multiplicity["bonferroni_all_abs_t"]) in report["significance"]
+
+
+def test_two_sided_z_thresholds_are_correct():
+    from backend.app.screener.events import _z_for_two_sided
+
+    assert _z_for_two_sided(0.05) == pytest.approx(1.96, abs=0.01)
+    assert _z_for_two_sided(0.05 / 2) == pytest.approx(2.241, abs=0.01)
+    assert _z_for_two_sided(0.05 / 24) == pytest.approx(3.09, abs=0.02)
+    assert _z_for_two_sided(0.10) < _z_for_two_sided(0.05)
 
 
 # --- 报告纪律 --------------------------------------------------------------

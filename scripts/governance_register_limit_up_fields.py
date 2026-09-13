@@ -99,6 +99,40 @@ FIELDS = (
 
 SCAN_REFERENCE = "limit_up_event_study_design@v1"
 
+#: v3：**稳健性检验的完整清单**，在与运行结果无关时就预先声明。
+#: 这一步的意义就是"先写下要看哪些比较、门槛是多少，再去看数字"。
+DESIGN_V3_REFERENCE = "limit_up_event_study_design@v3"
+DESIGN_V3 = {
+    "supersedes_note": "@v2 说明了日期错位无效与合法替代的方向；@v3 把**具体清单**钉死。",
+    "primary_endpoints": [
+        "continue_day_cnt@base_all 的『高组 − 低组』",
+        "seal_money@base_all 的『高组 − 低组』",
+    ],
+    "variants_declared": {
+        "continue_day_cnt": ["base_all", "matched_all", "base_high_seal", "base_low_seal"],
+        "seal_money": ["base_all", "matched_all", "base_first_board", "base_multi_board"],
+    },
+    "variant_definitions": {
+        "base_*": "对照 = 同日**同一成交额十分位**的非涨停标的等权收益（与 @v1 相同）",
+        "matched_all": "对照 = 同日**同一成交额十分位 × 同一事前 40 日动量三分位**；"
+                       "事前动量 = close_20_ago / close_60_ago − 1，窗口 (T−60, T−20]，"
+                       "**不含评估日当天**（用含当天涨停的 vol20/ma20 会污染匹配变量）",
+        "base_first_board": "seal_money 分组，**只在 continue_day_cnt == 1 的样本内**",
+        "base_multi_board": "seal_money 分组，**只在 continue_day_cnt >= 2 的样本内**",
+        "base_high_seal": "continue_day_cnt 分组，**只在封单 > 当日池内中位数**的样本内",
+        "base_low_seal": "continue_day_cnt 分组，**只在封单 <= 当日池内中位数**的样本内",
+    },
+    "stratification_note": "分层用的是**当日池内中位数**（与主分组同一口径），"
+                           "不因分层而重算阈值——否则每一层都是一个新口径。",
+    "replication": "对每个变体的『高−低』再做**分时段复现**：2022–2024 与 2025-01-01 起；"
+                   "后者对应涨停池上游零失败、覆盖完整的区间。",
+    "multiplicity": "计数 = 变体数 × 3 个统计量 + 分时段复现条目数；"
+                    "门槛同时给出：逐检验 1.96 / 主检验（2 条）Bonferroni / 全部比较 Bonferroni。",
+    "forbidden": "**禁止**在看到结果后再增删变体、改分层阈值或改分时段分界；"
+                 "任何此类改动必须新开 reference。同样禁止用『换个窗口直到显著』。",
+    "status": "已预注册，**结果尚未产生**（本条目与运行之间没有任何根据结果调整的余地）",
+}
+
 #: 首次执行后登记的**设计修正**。按方案 A.1「登记后不得改名或改定义——变更视为新条目」，
 #: 所以不是去改 @v1，而是新开 @v2。
 DESIGN_V2_REFERENCE = "limit_up_event_study_design@v2"
@@ -194,6 +228,19 @@ def main() -> int:
             exploratory=True, trial_count=len(FIELDS),
             notes="首次执行后发现日期错位安慰剂无效（§why），按 A.1 新开 reference 而不是改 @v1。"
                   "**没有**为了让安慰剂好看而改主统计量：主统计量定义未动（有测试钉住）。")
+
+    if DESIGN_V3_REFERENCE in existing:
+        plan.append(f"skip  {DESIGN_V3_REFERENCE}（已登记）")
+    else:
+        plan.append(f"add   {DESIGN_V3_REFERENCE}（kind=scan, 稳健性清单）")
+    if DESIGN_V3_REFERENCE not in existing and not args.dry_run:
+        governance.register_hypothesis(
+            kind="scan", name="涨停池事件研究稳健性检验清单（预注册）",
+            reference=DESIGN_V3_REFERENCE,
+            definition={**DOMAIN, **DESIGN_V3}, direction="无方向（清单登记）",
+            exploratory=True, trial_count=len(FIELDS),
+            notes="**先登记清单，再运行**：8 个变体、2 条主检验端点、分时段复现、"
+                  "以及多重检验门槛都写在看到数字之前。")
 
     batch_id = governance.current_batch_id()
     if batch_id and not args.dry_run:

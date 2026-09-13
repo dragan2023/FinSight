@@ -1,4 +1,4 @@
-"""涨停事件研究：**执行**已预注册的设计（`limit_up_event_study_design@v1`）。
+"""涨停事件研究：**执行**已预注册的设计（`limit_up_event_study_design@v1/@v2`）。
 
 设计登记在 `scripts/governance_register_limit_up_fields.py`（进 `hypothesis_registry`）。
 本模块只负责把它跑出来。**设计不在这里改**——要改设计就先改登记（新 reference），
@@ -10,8 +10,9 @@
 | 结果 | 事件后 N 个交易日的公司行动总收益 | `settlement_returns` + `service.total_return` |
 | 对照 | 同日**同一成交额十分位**的非涨停标的等权收益 | `cross_section` 的 `turnover_20` 分位 |
 | 统计量 | 配对超额**按评估日聚合**后的时间序列 t 值 | `_t_stat` |
-| 显著性 | `abs(t) >= 1.96`；**不**用安慰剂当门槛 | `_report()` 的 `significance` 字段 |
-| 安慰剂 | ① 对照置换（同十分位重抽）② 日期错位 | `_study_date` 内逐日重抽 / `_date_shift_placebo` |
+| 显著性 | `abs(t) >= 1.96`（多重检验校正后的门槛一并给出） | `_report()` 的 `significance` / `multiplicity` |
+| 安慰剂① | 对照置换（同层重抽）——**唯一合法的显著性参照** | `_study_date` 内逐日重抽 |
+| 安慰剂② | 日期错位——**已判定无效**，降级为诊断（见下） | `_date_shift_placebo` |
 
 **为什么不做横截面因子**：这几个字段在池外标的**没有取值**（未定义，不是缺失）。
 填 0 或当缺失塞进全市场横截面 IC，等于把"选择集"当成数值，算出来的 IC 无法解释。
@@ -20,22 +21,28 @@
 **结果侧纪律**：前向收益必然包含评估日之后的信息，只用于事后结算与评价，
 **绝不可**作为信号输入（与 `repository.settlement_returns` 的 docstring 同一条）。
 
-**两条实现纪律**（都是踩过之后写的）：
+**四条实现纪律**（都是踩过之后写的）：
 
-1. **重抽只在当日内存里做，做完就丢。** 把 1133 天 × 5000 只股票的前向收益全留下要几百 MB；
-   所以没有"先全量收集、再统一重抽"的写法，每天把 200 个重抽结果留下就走。
-2. **两个安慰剂必须与主统计量用同一个估计量。** 第一版日期错位用"全市场均值"当基准，
-   而主统计量用"同十分位对照均值"——两者不是同一个量，实测其 |t| 95 分位高达 **10.08**，
-   看起来像"主结果不显著"，实际是基准不一致造成的假象。已改为同一个配对估计量
-   （`bucket_mean` + `bucket_by_symbol`），并有测试钉住（把池内标的收益构造成恰好等于
-   同档对照均值，此时正确的日期错位必须给不出 t 值）。
+1. **重抽只在当日内存里做，做完就丢。** 把 1133 天 × 5000 只股票的前向收益全留下要几百 MB。
+2. **安慰剂必须与主统计量用同一个估计量**（踩过：第一版日期错位用全市场均值当基准）。
+3. **日期错位这个安慰剂本身是无效的**（`v2` 登记）：位移为正等于**用未来的涨停名单
+   度量今天**（前视选择）；固定位移又让逐日超额**强自相关**，而 t 假设逐日独立 →
+   |t| 被系统性放大（实测 |t| 95 分位 9.76，而应为≈1.96）。它保留为**诊断**，
+   **不得**充当零分布。
+4. **稳健性检验必须是"同日同池的相对比较"或"事前特征匹配"**：
+   - 池内子样本层（`_strata`）：同为涨停股、同一天，标的类型差异被差分掉；
+   - 事前特征匹配：用 `close_20_ago / close_60_ago − 1` 这类**不含评估日当天**的窗口，
+     若用含当天涨停的窗口（`vol20`/`ma20`），匹配变量本身就被事件污染了。
 """
 from __future__ import annotations
 
 import math
 import random
+from datetime import datetime, timedelta, timezone
 
 from .service import _stdev, total_return
+
+CST = timezone(timedelta(hours=8))
 
 #: 涨停池里可做事件研究的**数值**字段。`limit_up_reason` 是文本，需先定编码方案，
 #: 因此**不在这里**（登记条目里写明"本次不评价"）。
@@ -53,12 +60,14 @@ FIELD_ENCODINGS = {
     },
 }
 
-#: 成交额分位桶数（十分位）。
+#: 成交额分位桶数（十分位）；事前动量的分组数（三分位）。
 DECILES = 10
-#: 日期错位的最短位移：必须大于前瞻期，否则两段窗口重叠、错位就不成立。
+PRIOR_GROUPS = 3
+#: 日期错位的最短/最大位移（交易日索引）；该安慰剂已判定无效，仅保留为诊断。
 MIN_SHIFT = 25
-#: 日期错位的最大位移（交易日索引 Units）。
 MAX_SHIFT = 250
+#: 分时段复验的分界：**2025 年及以后**（涨停池覆盖 2022-01-04 起，2025 年后上游零失败）。
+REPLICATION_CUTOFF = "2025-01-01"
 
 
 def _clean(values) -> list[float]:
@@ -94,6 +103,23 @@ def _p95_abs(values) -> float | None:
     return round(clean[int(0.95 * (len(clean) - 1))], 6)
 
 
+def _z_for_two_sided(alpha: float) -> float:
+    """双侧显著性 `alpha` 对应的 |z|（用 erf 反解，不引入 scipy）。"""
+    target = 1 - alpha / 2
+    low, high = 0.0, 10.0
+    for _ in range(200):
+        mid = (low + high) / 2
+        if 0.5 * (1 + math.erf(mid / math.sqrt(2))) < target:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2
+
+
+def _day(date_ms: int) -> str:
+    return datetime.fromtimestamp(date_ms / 1000, CST).strftime("%Y-%m-%d")
+
+
 class LimitUpEventStudy:
     """事件研究。**每个参数都显式**，因为它们都会影响结论。"""
 
@@ -108,22 +134,67 @@ class LimitUpEventStudy:
         return sorted({row["date_ms"] for row in rows})
 
     @staticmethod
-    def _deciles(values: dict[str, float]) -> dict[str, int]:
-        """按成交额切十分位（0 = 最小的十分位）。"""
+    def _quantiles(values: dict[str, float], groups: int) -> dict[str, int]:
+        """按数值切等频分组（0 = 最小的一组）。"""
         if not values:
             return {}
         ordered = sorted(values.items(), key=lambda item: item[1])
         total = len(ordered)
-        return {symbol: min(DECILES - 1, position * DECILES // total)
+        return {symbol: min(groups - 1, position * groups // total)
                 for position, (symbol, _) in enumerate(ordered)}
 
+    @staticmethod
+    def _prior_momentum(row: dict) -> float | None:
+        """**事件前**的 40 日动量：`close_20_ago / close_60_ago − 1`。
+
+        窗口是 (T−60, T−20]，**完全不含评估日当天**——这是"事前特征匹配"的核心要求：
+        若改用含当天涨停的窗口（`vol20`、`ma20`），匹配变量本身就被事件污染了。
+        """
+        early, late = row.get("close_60_ago"), row.get("close_20_ago")
+        if not early or early <= 0 or not late or late <= 0:
+            return None
+        return late / early - 1
+
+    @staticmethod
+    def _strata(field: str):
+        """每个字段**预先声明**的子样本层（v2 稳健性检验）。
+
+        池内分层是"同日同池的相对比较"，对"这类标的本来就这样"的混淆免疫：
+        两组都是涨停股、同一天、同一套对照，差别只在分组变量上。
+        """
+        def above(value, median):
+            return isinstance(value, (int, float)) and median is not None and value > median
+
+        def at_or_below(value, median):
+            return isinstance(value, (int, float)) and median is not None and value <= median
+
+        if field == "seal_money":
+            # 封单额的区分度会不会只是"连板结构"的影子？在首板/连板内部各自再比一次。
+            return (("all", lambda item, med: True),
+                    ("first_board", lambda item, med: item.get("continue_day_cnt") == 1),
+                    ("multi_board",
+                     lambda item, med: (item.get("continue_day_cnt") or 0) >= 2))
+        # 连板高度的"无区分度"是否被封单结构掩盖？在封单高/低内部各自再比一次。
+        return (("all", lambda item, med: True),
+                ("high_seal",
+                 lambda item, med: above(item.get("seal_money"), med.get("seal_money"))),
+                ("low_seal",
+                 lambda item, med: at_or_below(item.get("seal_money"), med.get("seal_money"))))
+
+    @staticmethod
+    def _is_replication(date_ms: int) -> bool:
+        """是否属于分时段复验的后半段（2025 年及以后）。"""
+        return _day(date_ms) >= REPLICATION_CUTOFF
+
+    # --- 单日 -------------------------------------------------------------
     def _study_date(self, date_ms: int, pool: dict[str, dict], *, horizon_days: int,
                     fields: tuple[str, ...], draws: int, rng: random.Random,
                     pool_union: set[str]) -> dict[str, dict]:
-        """一个评估日：逐字段算真实超额 + 当日的 `draws` 次对照置换（用完即丢原始收益）。
+        """一个评估日：逐字段 × 逐变体算真实超额 + 当日的 `draws` 次对照置换。
 
-        取数（横截面 + 前向收益）**只做一次**，所有字段共用——两个字段各跑一遍会让
-        取数成本翻倍，而它们的样本域与对照完全相同。
+        取数（横截面 + 前向收益）**只做一次**，所有字段与所有变体共用——这是把
+        "一个字段一遍"改成"一遍出全部"的原因：两个字段各跑一遍会让取数成本翻倍，
+        而分层与匹配变体的边际成本只是记账与重抽。原始收益当天用完就丢。
         """
         cross = self._repository.cross_section(date_ms=date_ms)
         outcome = {row["thscode"]: total_return(row)
@@ -135,87 +206,121 @@ class LimitUpEventStudy:
                     if (row.get("turnover_20") or 0) > 0}
         if not turnover:
             return {}
-        buckets = self._deciles(turnover)
-        # 对照池：当日有成交、有前向收益、且**不在涨停池里**的标的，按十分位分组
-        control: dict[int, list[float]] = {}
+        buckets = self._quantiles(turnover, DECILES)
+        prior = {}
+        for row in cross:
+            value = self._prior_momentum(row)
+            if value is not None:
+                prior[row["thscode"]] = value
+        terciles = self._quantiles(prior, PRIOR_GROUPS)
+
+        # 两套对照网格：粗（成交额十分位）与细（十分位 × 事前动量三分位）。
+        # 对照池排除涨停标的自身，否则超额会被自己压成 0。
+        coarse: dict[int, list[float]] = {}
+        fine: dict[tuple[int, int], list[float]] = {}
         for symbol, bucket in buckets.items():
             if symbol in pool or symbol not in outcome:
                 continue
-            control.setdefault(bucket, []).append(outcome[symbol])
-        if not control:
+            value = outcome[symbol]
+            coarse.setdefault(bucket, []).append(value)
+            fine.setdefault((bucket, terciles.get(symbol, -1)), []).append(value)
+        if not coarse:
             return {}
-        # 每个十分位的对照均值**只算一次**：置换的 innermost 循环要跑
-        # draws × 事件数 次，若在里面重算 500 个元素的均值就是几十亿次运算。
-        bucket_mean = {bucket: _mean(values) for bucket, values in control.items()}
-        if not any(value == value for value in bucket_mean.values()):
+        # 每格对照均值**只算一次**：置换的 innermost 循环要跑 draws × 事件数 次，
+        # 在里面重算几百个元素的均值就是几十亿次运算。
+        coarse_mean = {key: _mean(values) for key, values in coarse.items()}
+        fine_mean = {key: _mean(values) for key, values in fine.items()}
+        if not any(value == value for value in coarse_mean.values()):
             return {}
 
         details: dict[str, dict] = {}
         for field in fields:
             encoding = FIELD_ENCODINGS[field]
-            numeric = sorted(item[field] for item in pool.values()
-                             if isinstance(item.get(field), (int, float)))
-            median = numeric[len(numeric) // 2] if numeric else None
-            events: dict[str, list[tuple[int, float]]] = {"high": [], "low": []}
-            for item in pool.values():
-                symbol = item.get("thscode")
-                if symbol not in outcome or symbol not in buckets:
-                    continue
-                flag = encoding["rule"](item.get(field), median)
-                if flag is None:
-                    continue
-                bucket = buckets[symbol]
-                if not control.get(bucket):
-                    continue      # 该十分位没有对照 → 这个事件不参与，绝不拿别的桶凑
-                events["high" if flag else "low"].append((bucket, outcome[symbol]))
+            # 分层要用到**另一个字段**的中位数（例如"封单高"这一层）
+            medians = {}
+            for other in FIELD_ENCODINGS:
+                numeric = sorted(item[other] for item in pool.values()
+                                 if isinstance(item.get(other), (int, float)))
+                medians[other] = numeric[len(numeric) // 2] if numeric else None
+            median = medians[field]
 
-            detail: dict = {"date_ms": date_ms, "median": median}
-            for side in ("high", "low"):
-                values = events[side]
-                detail[f"{side}_events"] = len(values)
-                detail[f"{side}_excess"] = _mean([value - bucket_mean[bucket]
-                                                  for bucket, value in values])
-            permuted = {side: [] for side in ("high", "low")}
-            for _ in range(draws):
+            variants: dict[str, dict] = {}
+            for name, predicate in self._strata(field):
+                for matched in (False, True):
+                    if matched and name != "all":
+                        continue    # 精细匹配只在 all 层做：**预先声明**，避免统计量爆炸
+                    variant = ("matched_" if matched else "base_") + name
+                    means = fine_mean if matched else coarse_mean
+                    grids = fine if matched else coarse
+                    events: dict[str, list[tuple]] = {"high": [], "low": []}
+                    for item in pool.values():
+                        symbol = item.get("thscode")
+                        if symbol not in outcome or symbol not in buckets:
+                            continue
+                        if not predicate(item, medians):
+                            continue
+                        flag = encoding["rule"](item.get(field), median)
+                        if flag is None:
+                            continue
+                        key = ((buckets[symbol], terciles.get(symbol, -1)) if matched
+                               else buckets[symbol])
+                        if key not in means or means[key] != means[key]:
+                            continue    # 该格没有对照 → 这个事件不参与，绝不拿别的格子凑
+                        events["high" if flag else "low"].append((key, outcome[symbol]))
+                    variants[variant] = {"events": events, "means": means, "grid": grids,
+                                         "matched": matched}
+
+            detail: dict = {"date_ms": date_ms, "median": median, "variants": {}}
+            for variant, payload in variants.items():
+                means, grids = payload["means"], payload["grid"]
+                entry: dict = {}
                 for side in ("high", "low"):
-                    values = []
-                    for bucket, _ in events[side]:
-                        matched = control[bucket]
-                        values.append(matched[rng.randrange(len(matched))]
-                                      - bucket_mean[bucket])
-                    permuted[side].append(_mean(values))
-            detail["permuted"] = permuted
-            detail["events_used"] = detail["high_events"] + detail["low_events"]
-            # 对照规模要报出来：事件被跳过的唯一原因就是"该十分位没有对照"，
-            # 不给出这个数字，读者无法判断"事件少"是市场本来如此还是对照没配上。
-            detail["control_size"] = sum(len(values) for values in control.values())
-            detail["control_buckets"] = len(control)
+                    values = payload["events"][side]
+                    entry[f"{side}_events"] = len(values)
+                    entry[f"{side}_excess"] = _mean([value - means[key]
+                                                     for key, value in values])
+                permuted = {side: [] for side in ("high", "low")}
+                for _ in range(draws):
+                    for side in ("high", "low"):
+                        candidates = payload["events"][side]
+                        sampled = []
+                        for key, _ in candidates:
+                            options = grids[key]
+                            sampled.append(options[rng.randrange(len(options))] - means[key])
+                        permuted[side].append(_mean(sampled))
+                entry["permuted"] = permuted
+                entry["events_used"] = entry["high_events"] + entry["low_events"]
+                detail["variants"][variant] = entry
+            # 向后兼容：顶层字段 = base_all 变体（旧调用方与测试直接读 results/permuted）
+            detail.update(detail["variants"]["base_all"])
+            detail["control_size"] = sum(len(values) for values in coarse.values())
+            detail["control_buckets"] = len(coarse)
+            detail["control_cells_matched"] = len(fine)
             details[field] = detail
 
-        # 日期错位所需的**极小**留存：池内标的的当日收益、它落在哪个十分位、
-        # 以及各十分位的对照均值。**不留**全市场收益——
-        # 池内标的在任意一天通常只有一两百只有数据。
+        # 日期错位（**已判定无效**，仅留作诊断）所需的极小留存：池内标的当日收益、
+        # 它落在哪个十分位、以及各十分位的对照均值。**不留**全市场收益。
         shared = {
             "pool_returns": {symbol: outcome[symbol] for symbol in pool_union
                              if symbol in outcome},
             "bucket_by_symbol": {symbol: buckets[symbol] for symbol in pool_union
                                  if symbol in buckets},
-            "bucket_mean": bucket_mean,
+            "bucket_mean": coarse_mean,
             "pool_codes": list(pool),
         }
         for detail in details.values():
             detail.update(shared)
         return details
 
-    # --- 日期错位 ---------------------------------------------------------
+    # --- 日期错位（诊断，非零分布）-----------------------------------------
     def _date_shift_placebo(self, per_date: dict[int, dict], dates: list[int], *,
                             draws: int, seed: int) -> dict:
-        """把**池子整体平移到随机其它交易日**，配对超额应≈0。
+        """把**池子整体平移到随机其它交易日**。
 
-        **必须与主统计量用同一个估计量**：主统计量是"事件收益 − 同十分位对照均值"，
-        所以这里也必须是"被平移过来的标的收益 − 该标的在**当天**所在十分位的对照均值"。
-        第一版用了全市场均值当基准，实测 |t| 95 分位 10.08——那不是"主结果不显著"，
-        而是基准不一致（全市场均值会引入 beta/热度偏差）。
+        ⚠️ **它不是零分布**（v2 登记）：位移为正等于用未来的涨停名单度量今天，
+        而固定位移又让逐日超额强自相关，两者都会把 |t| 抬到 9 以上（实测 95 分位 9.76，
+        而应为≈1.96）。保留它是为了那个**诊断**信息：非事件队列的同档超额也不为 0，
+        说明成交额十分位匹配没有中和标的类型差异。**不得**当显著性门槛。
         """
         rng = random.Random(f"shift:{seed}")
         window = MAX_SHIFT - MIN_SHIFT + 1
@@ -240,86 +345,140 @@ class LimitUpEventStudy:
                     value = current["pool_returns"].get(symbol)
                     if value is None or mean is None or mean != mean:
                         continue
-                    values.append(value - mean)      # ← 与主统计量同一个配对估计量
+                    values.append(value - mean)      # 与主统计量同一个配对估计量
                 if values:
                     series.append(_mean(values))
             statistic = _t_stat(series)
             if statistic is not None:
                 statistics.append(statistic)
-        return {"kind": "日期错位（池子整体平移，配对估计量与主统计量一致）",
+        return {"kind": "日期错位（**已判定无效，仅作诊断**）",
                 "draws": len(statistics),
                 "t_mean": round(_mean(statistics), 6) if statistics else None,
                 "t_abs_p95": _p95_abs(statistics),
-                "note": f"位移 {MIN_SHIFT}–{MAX_SHIFT} 个交易日（最短位移大于前瞻期，"
-                        f"避免窗口重叠）。真零分布下 |t| 的 95 分位应≈1.96。"}
+                "verdict": "无效：位移为正＝用未来名单度量今天（前视选择）；固定位移使逐日"
+                           "超额强自相关而 t 假设独立 → |t| 被系统性放大。**不得**当门槛。",
+                "diagnostic_value": "非事件队列的同档配对超额也不为 0 → 成交额十分位匹配"
+                                    "没有中和标的类型差异 → 跨样本的『水平』差异不得归因于事件。"}
 
     # --- 汇总 -------------------------------------------------------------
-    def _report(self, field: str, per_date: dict[int, dict], *, horizon_days: int,
-                draws: int, seed: int, dates_with_pool: int) -> dict:
-        usable = sorted(per_date)
+    def _variant_report(self, field: str, per_date: dict[int, dict], usable: list[int],
+                        variant: str, draws: int) -> dict:
+        entries = [per_date[date_ms]["variants"][variant] for date_ms in usable]
         results = {}
         for side, label in zip(("high", "low"), FIELD_ENCODINGS[field]["groups"]):
-            series = [per_date[date_ms][f"{side}_excess"] for date_ms in usable]
+            series = [entry[f"{side}_excess"] for entry in entries]
             results[side] = {
-                "group": label, "events": sum(per_date[d][f"{side}_events"] for d in usable),
+                "group": label, "events": sum(entry[f"{side}_events"] for entry in entries),
                 "mean_excess": round(_mean(series), 6), "t_stat": _t_stat(series),
                 "days_positive": sum(1 for value in _clean(series) if value > 0),
             }
-        diff = [per_date[d]["high_excess"] - per_date[d]["low_excess"] for d in usable]
+        diff = [entry["high_excess"] - entry["low_excess"] for entry in entries]
         results["high_minus_low"] = {"group": "高组 − 低组", "events": None,
                                      "mean_excess": round(_mean(diff), 6),
                                      "t_stat": _t_stat(diff),
                                      "days_positive": sum(1 for value in _clean(diff) if value > 0)}
-
         # 合并逐日置换：**同一抽签序号跨日**组合成一条可能的历史，再算 t 分布。
         # 高组−低组也要有自己的零分布——不然"没有区分度"这句话就没有对照。
-        permutation = {}
+        by_group = {}
         for side in ("high", "low", "high_minus_low"):
             statistics = []
             for draw in range(draws):
                 if side == "high_minus_low":
-                    series = [per_date[d]["permuted"]["high"][draw]
-                              - per_date[d]["permuted"]["low"][draw] for d in usable]
+                    series = [entry["permuted"]["high"][draw] - entry["permuted"]["low"][draw]
+                              for entry in entries]
                 else:
-                    series = [per_date[d]["permuted"][side][draw] for d in usable]
+                    series = [entry["permuted"][side][draw] for entry in entries]
                 statistics.append(_t_stat(series))
             clean = _clean(statistics)
-            permutation[side] = {
-                "t_mean": round(_mean(clean), 6) if clean else None,
-                "t_abs_p95": _p95_abs(clean),
-                "t_draws": len(clean),
-                "real_t": results[side]["t_stat"]}
+            by_group[side] = {"t_mean": round(_mean(clean), 6) if clean else None,
+                              "t_abs_p95": _p95_abs(clean), "t_draws": len(clean),
+                              "real_t": results[side]["t_stat"]}
+        matched = variant.startswith("matched_")
+        stratum = variant.split("_", 1)[1]
+        return {
+            "variant": variant,
+            "matching": ("成交额十分位 × 事前 40 日动量三分位" if matched
+                         else "成交额十分位"),
+            "stratum": stratum,
+            "events": sum(entry["events_used"] for entry in entries),
+            "results": results,
+            "placebo": {"kind": "对照置换（同层重抽，保样本量与日期分布）",
+                        "by_group": by_group},
+        }
+
+    def _report(self, field: str, per_date: dict[int, dict], *, horizon_days: int,
+                draws: int, seed: int, dates_with_pool: int) -> dict:
+        usable = sorted(per_date)
+        names = sorted(per_date[usable[0]]["variants"]) if usable else []
+        variants = {name: self._variant_report(field, per_date, usable, name, draws)
+                    for name in names}
+        base = variants.get("base_all", {})
+
+        # 分时段复验：只对**主检验端点**（各变体的「高−低」）做，属于复现而非新家族，
+        # 但仍计入多重检验计数（方案 A.2：计数必须包含全部看过的比较）。
+        replication = {}
+        for name, payload in variants.items():
+            for label, wanted in (("2022-2024", False), ("2025-2026", True)):
+                subset = [date_ms for date_ms in usable
+                          if self._is_replication(date_ms) is wanted]
+                if len(subset) < 3:
+                    continue
+                series = [per_date[d]["variants"][name]["high_excess"]
+                          - per_date[d]["variants"][name]["low_excess"] for d in subset]
+                replication[f"{name}@{label}"] = {
+                    "dates": len(subset), "mean_excess": round(_mean(series), 6),
+                    "t_stat": _t_stat(series)}
+
+        statistics_tested = len(variants) * 3 + len(replication)
+        primary_threshold = round(_z_for_two_sided(0.05 / 2), 3)
+        all_threshold = round(_z_for_two_sided(0.05 / statistics_tested), 3)
         return {
             "field": field, "field_name": FIELD_ENCODINGS[field]["name"],
             "groups": FIELD_ENCODINGS[field]["groups"], "split": FIELD_ENCODINGS[field]["split"],
             "horizon_days": horizon_days, "draws": draws,
-            "dates_with_pool": dates_with_pool,
-            "dates_usable": len(usable),
-            "events_total": sum(per_date[d]["events_used"] for d in usable),
-            "control_size_median": sorted(per_date[d]["control_size"] for d in usable)[
-                len(usable) // 2] if usable else None,
-            "results": results,
+            "dates_with_pool": dates_with_pool, "dates_usable": len(usable),
+            "events_total": base.get("events", 0),
+            "control_size_median": (sorted(per_date[d]["control_size"] for d in usable)[
+                len(usable) // 2] if usable else None),
+            "results": base.get("results", {}),
+            "variants": variants,
+            "by_period": replication,
+            "multiplicity": {
+                "variants": names,
+                "statistics_tested": statistics_tested,
+                "definition": f"{len(variants)} 个变体 × 3 个统计量 + {len(replication)} 个"
+                              f"分时段复现 = {statistics_tested}",
+                "primary_endpoints": ["base_all.high_minus_low（每字段一条，共 2 条）"],
+                "per_test_abs_t": 1.96,
+                "bonferroni_primary_abs_t": primary_threshold,
+                "bonferroni_all_abs_t": all_threshold,
+                "note": "按方案 A.2，多重检验计数必须包含**全部尝试过的**比较（含本轮新增的"
+                        "稳健性变体与分时段复现）；主检验只有 2 条，其余是稳健性检验。"
+                        "两套门槛都给出来，读者可自行判断哪些结论同时过严格门槛。",
+            },
             "placebo": {
-                "permutation": {
-                    "kind": "对照置换（同十分位重抽，保样本量与日期分布）",
-                    "by_group": permutation,
-                    "note": "真零分布下 t 的绝对值 95 分位应≈1.96；明显偏离说明零分布构造有问题。"
-                            "`real_t` 与 `t_abs_p95` 可直接对照。",
-                },
+                "permutation": {**base.get("placebo", {}),
+                                "role": "**唯一合法的显著性参照**（同日同层重抽）",
+                                "note": "真零分布下 |t| 的 95 分位应≈1.96；"
+                                        "`real_t` 与 `t_abs_p95` 可直接对照。"},
                 "date_shift": self._date_shift_placebo(per_date, usable, draws=draws, seed=seed),
             },
-            "significance": "看 t 值（|t| >= 1.96）。安慰剂用于机制自检与对照，"
-                            "**不得**当作显著性门槛（`13` 号文档的方法学修正）。",
-            "design": "hypothesis_registry: limit_up_event_study_design@v1",
+            "significance": "看 t 值。逐检验门槛 1.96；多重检验校正后的门槛见 `multiplicity`"
+                            f"（主检验 |t|≥{primary_threshold}，全部比较 |t|≥{all_threshold}）。"
+                            "安慰剂只作机制自检，**不得**当作显著性门槛。",
+            "design": "hypothesis_registry: limit_up_event_study_design@v1 / @v2",
             "limitations": [
                 "涨停池只覆盖已同步的交易日（实测可回溯到 2022-01-05，更早的日子静默返回 0 条），"
                 "样本是 2022 年以后的市场状态，不可外推。",
-                "对照只匹配成交额十分位，**没有**匹配行业、市值、β——配对超额里仍含这些"
-                "未控制维度的差异。",
+                "对照匹配成交额十分位（精细变体再加事前 40 日动量三分位），"
+                "**没有**匹配行业、市值、β——配对超额里仍含这些未控制维度的差异。",
                 "本地行情库不含退市标的（幸存者偏差），『涨停后一路走坏直至退市』的情形"
                 "不可能出现在样本里，因此负向超额被**低估**、正向超额被高估。",
-                "这是**超额**（相对同档对照），不是可实现收益：不计交易成本、不考虑次日"
-                "难以成交、也不构成任何可执行的多空策略。",
+                "这是**超额**（相对同层对照），不是可实现收益：不计交易成本、不考虑次日"
+                "难以成交，也不构成任何可执行的多空策略。封板标的**当日收盘价买不到**，"
+                "而窗口隐含『按 close_T 成交』。",
+                "逐日超额存在重叠样本（连板连续上榜）与市场状态持续，t 值假设逐日独立，"
+                "因此 |t| 偏乐观；分时段复验与多重检验门槛是为此设的防线。",
                 "前向收益含评估日之后的信息，**只用于事后评价**，不得作为信号输入。",
             ],
             "disclaimer": "研究参考，不构成投资建议。",
@@ -329,7 +488,7 @@ class LimitUpEventStudy:
     def run_fields(self, *, fields: tuple[str, ...], start_ms: int | None = None,
                    end_ms: int | None = None, horizon_days: int = 20, draws: int = 200,
                    seed: int = 20260913, progress=None) -> dict[str, dict]:
-        """**一次遍历**算出多个字段：取数只做一遍，字段各自分组与重抽。"""
+        """**一次遍历**算出多个字段的全部变体：取数只做一遍，字段与变体各自分组与重抽。"""
         unknown = [item for item in fields if item not in FIELD_ENCODINGS]
         if unknown:
             raise ValueError(f"不支持的事件研究字段：{unknown}（可选 {list(FIELD_ENCODINGS)}）")
@@ -368,7 +527,7 @@ class LimitUpEventStudy:
             if not per_field[field]:
                 reports[field] = {
                     "field": field, "dates_usable": 0, "dates_with_pool": len(dates),
-                    "reason": "没有任何评估日同时齐备『池内标的 + 同十分位对照 + 前向窗口』。"}
+                    "reason": "没有任何评估日同时齐备『池内标的 + 同层对照 + 前向窗口』。"}
                 continue
             reports[field] = self._report(field, per_field[field], horizon_days=horizon_days,
                                           draws=draws, seed=seed, dates_with_pool=len(dates))
@@ -377,7 +536,7 @@ class LimitUpEventStudy:
     def run(self, *, start_ms: int | None = None, end_ms: int | None = None,
             horizon_days: int = 20, field: str = "continue_day_cnt",
             draws: int = 200, seed: int = 20260913, progress=None) -> dict:
-        """单字段入口（保持返回结构不变）。"""
+        """单字段入口（返回结构保持 `results` = base_all，向后兼容）。"""
         return self.run_fields(fields=(field,), start_ms=start_ms, end_ms=end_ms,
                                horizon_days=horizon_days, draws=draws, seed=seed,
                                progress=progress)[field]
