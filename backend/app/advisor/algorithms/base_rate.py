@@ -56,6 +56,9 @@ def total_return_closes(items: Iterable[Mapping[str, object]], *,
     ``as_of_ms`` 之后的事件与行情**一律丢弃**：任何越过 as-of 的复权事件都是
     未来信息泄漏。返回 ``raw_closes`` 供价格水平类计算（当前价、情景 EV）使用，
     ``closes`` 供收益类计算（状态基率、波动率、市场状态）使用。
+
+    每项还带 ``open_price``（总收益口径）：开盘价按当日 ``level/close`` 同一比例
+    折算，因此除权日的开盘价与收盘价口径一致，可直接用于「次日开盘成交」的回测。
     """
     raw_closes: list[dict] = []
     return_closes: list[dict] = []
@@ -74,6 +77,12 @@ def total_return_closes(items: Iterable[Mapping[str, object]], *,
         if date_ms <= 0 or close <= 0:
             skipped_bar_count += 1
             continue
+        try:
+            opening = float(item["open_price"])  # type: ignore[arg-type]
+        except (KeyError, TypeError, ValueError):
+            opening = None
+        if opening is not None and opening <= 0:
+            opening = None
         if level is None:
             level = close
         else:
@@ -87,8 +96,10 @@ def total_return_closes(items: Iterable[Mapping[str, object]], *,
                 continue
             level *= factor
             applied_event_count += int(item.get("event_count") or 0)
-        raw_closes.append({"date_ms": date_ms, "close_price": close})
-        return_closes.append({"date_ms": date_ms, "close_price": level})
+        scale = level / close
+        raw_closes.append({"date_ms": date_ms, "close_price": close, "open_price": opening})
+        return_closes.append({"date_ms": date_ms, "close_price": level,
+                              "open_price": None if opening is None else opening * scale})
     return {
         "basis": BASIS_CORPORATE_ACTION_TOTAL_RETURN,
         "raw_closes": raw_closes,

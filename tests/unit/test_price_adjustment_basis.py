@@ -141,6 +141,31 @@ def test_base_rate_uses_total_return_series_and_declares_its_basis():
     assert "公司行动总收益" in adjusted["note"]
 
 
+def test_local_price_bars_enforce_as_of_cutoff_and_carry_open_prices(tmp_path):
+    """本地实验数据源（`strategy/local_bars.py`）必须带开盘价并强制 as-of 截断。
+
+    这是 C2 批量实验的数据入口（D11/D12）：「次日开盘成交」的回测没有开盘价就
+    一笔交易都不会发生；口径又必须自证，否则实验落库会谎报数据来源。
+    """
+    from backend.app.strategy.local_bars import local_price_bars
+
+    repository = WarehouseRepository(tmp_path / "market.duckdb")
+    _write_market_fixture(repository)
+
+    bars, snapshot = local_price_bars(repository, THSCODE, start_ms=0, end_ms=DAY_MS * 50)
+
+    assert len(bars) == 50  # as-of 之后的 10 根不得出现
+    assert all(bar.open is not None for bar in bars)
+    assert snapshot["basis"] == BASIS_CORPORATE_ACTION_TOTAL_RETURN
+    assert snapshot["end"] == "1970-02-20"
+    assert snapshot["applied_event_count"] == 1  # 只有第 41 日的 10 送 10
+    # 两层截断：仓库 SQL 的 `date_ms <= end_ms` 先挡掉 as-of 之后的行情，
+    # 所以转换层的计数器为 0——这正是纵深防护生效的证据，不是漏截断。
+    assert snapshot["dropped_after_as_of_count"] == 0
+    assert snapshot["missing_open_bars"] == 0
+    assert min(_returns([bar.close for bar in bars])) > -1e-9  # 无机械性 −50%
+
+
 def test_base_rate_declares_downgrade_when_total_return_series_is_too_short():
     """总收益序列不足时如实降标口径，绝不假装仍在用复权口径。"""
     series = [{"date_ms": DAY_MS * (index + 1), "close_price": 100.0} for index in range(200)]

@@ -18,6 +18,9 @@ frontend/dist/
 # ==== 本地行情大数据（约 884 MB，可由 scripts/sync_*.py 重新同步，不入库）====
 data/market/
 
+# ==== 运行时导出产物（人工触发的落盘，属于本机数据而非代码）====
+data/exports/
+
 # ==== 运行时产物 ====
 logs/*.log
 logs/startup.lock
