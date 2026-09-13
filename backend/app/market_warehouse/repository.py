@@ -291,6 +291,167 @@ class WarehouseRepository:
                 "applied_event_count": applied_event_count, "unmatched_event_count": len(unmatched_event_dates),
                 "unmatched_event_dates": unmatched_event_dates,
                 "invalid_factor_count": invalid_factor_count}
+
+    def cross_section(self, *, date_ms: int, history_days: int = 400) -> list[dict]:
+        """时点横截面原始聚合（**固定 SQL 模板，不接受任何调用方 SQL**）。
+
+        为 `screener` 提供一只标的在评估日 T 的、只用到 `<= T` 信息的量价与流动性原料：
+
+        - **as-of 截断**：行情行与公司行动事件都以 `date_ms <= T` 为界，绝不使用未来信息；
+        - **只在 T 当日有成交**才进入结果（`last_ms == T`），停牌标的自然被排除；
+        - **动量用公司行动总收益口径**：把窗口内 `(T-20, T]` / `(T-60, T]` 的除权事件
+          （送股/配股/现金分红）折算进比值，避免除权日的机械跳空被当成真实下跌。
+          这正是 P0-1 的口径，只是下沉到 SQL 里一次算完，而不是逐只标的跑 Python。
+
+        返回的是**原料**，不含任何筛选或排序——股票池规则与因子定义在 `screener` 层，
+        这样"为什么这只被排除"可以逐条解释。
+        """
+        if date_ms <= 0:
+            raise ValueError("评估日必须为正的毫秒时间戳。")
+        if not 60 <= history_days <= 1500:
+            raise ValueError("回溯自然日数需在 60–1500 之间。")
+        if not self.path.exists():
+            return []
+        start_ms = date_ms - history_days * 86_400_000
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            rows = db.execute("""
+                WITH base AS (
+                    SELECT thscode, date_ms, close_price, high_price, volume, turnover,
+                           lag(close_price) OVER (PARTITION BY thscode ORDER BY date_ms) AS prev_close
+                    FROM daily_k
+                    WHERE date_ms <= ? AND date_ms >= ? AND close_price > 0
+                ), ranked AS (
+                    SELECT *, row_number() OVER (PARTITION BY thscode ORDER BY date_ms DESC) AS back
+                    FROM base
+                ), agg AS (
+                    SELECT thscode,
+                        max(CASE WHEN back = 1 THEN date_ms END) AS last_ms,
+                        max(CASE WHEN back = 1 THEN close_price END) AS close,
+                        max(CASE WHEN back = 1 THEN prev_close END) AS prev_close,
+                        max(CASE WHEN back = 1 THEN high_price END) AS high,
+                        max(CASE WHEN back = 1 THEN turnover END) AS turnover_today,
+                        max(CASE WHEN back = 1 THEN volume END) AS volume_today,
+                        max(CASE WHEN back = 21 THEN date_ms END) AS date_20_ago,
+                        max(CASE WHEN back = 21 THEN close_price END) AS close_20_ago,
+                        max(CASE WHEN back = 61 THEN date_ms END) AS date_60_ago,
+                        max(CASE WHEN back = 61 THEN close_price END) AS close_60_ago,
+                        count(*) AS bars,
+                        avg(CASE WHEN back <= 20 THEN turnover END) AS turnover_20,
+                        avg(CASE WHEN back <= 20 THEN volume END) AS volume_20,
+                        avg(CASE WHEN back <= 20 THEN close_price END) AS ma20,
+                        avg(CASE WHEN back <= 60 THEN close_price END) AS ma60,
+                        stddev_pop(CASE WHEN back <= 20 AND prev_close > 0
+                                        THEN close_price / prev_close - 1 END) AS vol20
+                    FROM ranked GROUP BY thscode
+                ), events AS (
+                    SELECT a.thscode,
+                        sum(CASE WHEN a.ex_date_ms > g.date_20_ago AND a.ex_date_ms <= g.last_ms
+                                 THEN coalesce(a.per_share_bonus, 0) ELSE 0 END) AS bonus_20,
+                        sum(CASE WHEN a.ex_date_ms > g.date_20_ago AND a.ex_date_ms <= g.last_ms
+                                 THEN coalesce(a.dividend_per_share, 0) ELSE 0 END) AS div_20,
+                        sum(CASE WHEN a.ex_date_ms > g.date_20_ago AND a.ex_date_ms <= g.last_ms
+                                 THEN coalesce(a.allotment_ratio, 0) ELSE 0 END) AS rights_20,
+                        sum(CASE WHEN a.ex_date_ms > g.date_20_ago AND a.ex_date_ms <= g.last_ms
+                                 THEN coalesce(a.allotment_ratio, 0) * coalesce(a.allotment_price, 0)
+                                 ELSE 0 END) AS rights_cost_20,
+                        sum(CASE WHEN a.ex_date_ms > g.date_60_ago AND a.ex_date_ms <= g.last_ms
+                                 THEN coalesce(a.per_share_bonus, 0) ELSE 0 END) AS bonus_60,
+                        sum(CASE WHEN a.ex_date_ms > g.date_60_ago AND a.ex_date_ms <= g.last_ms
+                                 THEN coalesce(a.dividend_per_share, 0) ELSE 0 END) AS div_60,
+                        sum(CASE WHEN a.ex_date_ms > g.date_60_ago AND a.ex_date_ms <= g.last_ms
+                                 THEN coalesce(a.allotment_ratio, 0) ELSE 0 END) AS rights_60,
+                        sum(CASE WHEN a.ex_date_ms > g.date_60_ago AND a.ex_date_ms <= g.last_ms
+                                 THEN coalesce(a.allotment_ratio, 0) * coalesce(a.allotment_price, 0)
+                                 ELSE 0 END) AS rights_cost_60,
+                        count(*) AS event_rows
+                    FROM adjustment_factors a JOIN agg g ON g.thscode = a.thscode
+                    WHERE a.ex_date_ms <= ?          -- as-of 截断：不含已公告的未来除权日
+                    GROUP BY a.thscode
+                )
+                SELECT g.thscode, g.last_ms, g.close, g.prev_close, g.high, g.turnover_today,
+                       g.volume_today, g.turnover_20, g.volume_20, g.ma20, g.ma60, g.vol20,
+                       g.bars, g.close_20_ago, g.close_60_ago,
+                       coalesce(e.bonus_20, 0), coalesce(e.div_20, 0), coalesce(e.rights_20, 0),
+                       coalesce(e.rights_cost_20, 0),
+                       coalesce(e.bonus_60, 0), coalesce(e.div_60, 0), coalesce(e.rights_60, 0),
+                       coalesce(e.rights_cost_60, 0), coalesce(e.event_rows, 0)
+                FROM agg g LEFT JOIN events e ON e.thscode = g.thscode
+                WHERE g.last_ms = ?
+                ORDER BY g.thscode
+            """, [date_ms, start_ms, date_ms, date_ms]).fetchall()
+        except duckdb.CatalogException:
+            return []
+        finally:
+            db.close()
+        keys = ("thscode", "last_ms", "close", "prev_close", "high", "turnover_today",
+                "volume_today", "turnover_20", "volume_20", "ma20", "ma60", "vol20", "bars",
+                "close_20_ago", "close_60_ago", "bonus_20", "div_20", "rights_20", "rights_cost_20",
+                "bonus_60", "div_60", "rights_60", "rights_cost_60", "event_rows")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def settlement_returns(self, *, date_ms: int, horizon_days: int) -> list[dict]:
+        """**仅用于结算/回溯评估**的前向收益（固定 SQL 模板）。
+
+        ⚠️ 这是**结果侧**数据：它必然包含评估日之后的信息，**绝不可作为信号输入**。
+        与 `corporate_action_total_return_history` 的 docstring 同一条纪律——它的
+        合法用途只有"事后核对当时说了什么、后来发生了什么"。
+
+        口径：`(close_{T+h} × (1+送股+配股) + 现金分红 − 配股成本) / close_T − 1`，
+        即窗口 `(T, T+h]` 内的**总收益**，除权除息日不会被记成真实涨跌。
+        """
+        if date_ms <= 0 or not 1 <= horizon_days <= 250:
+            raise ValueError("评估日必须为正、预测期需在 1–250 个交易日之间。")
+        if not self.path.exists():
+            return []
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            rows = db.execute("""
+                WITH at_t AS (
+                    SELECT thscode, close_price AS close_t, date_ms AS t_ms,
+                           row_number() OVER (PARTITION BY thscode ORDER BY date_ms DESC) AS rn
+                    FROM daily_k WHERE date_ms <= ? AND close_price > 0
+                ), base_t AS (
+                    SELECT thscode, close_t, t_ms FROM at_t WHERE rn = 1
+                ), forwards AS (
+                    SELECT d.thscode, d.date_ms AS fwd_ms, d.close_price AS fwd_close,
+                           row_number() OVER (PARTITION BY d.thscode ORDER BY d.date_ms) AS step
+                    FROM daily_k d JOIN base_t b ON b.thscode = d.thscode
+                    WHERE d.date_ms > b.t_ms AND d.close_price > 0
+                ), horizon AS (
+                    SELECT thscode,
+                           max(CASE WHEN step = ? THEN fwd_ms END) AS horizon_ms,
+                           max(CASE WHEN step = ? THEN fwd_close END) AS horizon_close
+                    FROM forwards GROUP BY thscode
+                ), events AS (
+                    SELECT a.thscode,
+                           sum(coalesce(a.per_share_bonus, 0)) AS bonus,
+                           sum(coalesce(a.dividend_per_share, 0)) AS dividend,
+                           sum(coalesce(a.allotment_ratio, 0)) AS rights,
+                           sum(coalesce(a.allotment_ratio, 0) * coalesce(a.allotment_price, 0))
+                               AS rights_cost
+                    FROM adjustment_factors a
+                    JOIN base_t b ON b.thscode = a.thscode
+                    JOIN horizon h ON h.thscode = a.thscode
+                    WHERE a.ex_date_ms > b.t_ms AND a.ex_date_ms <= h.horizon_ms
+                    GROUP BY a.thscode
+                )
+                SELECT b.thscode, b.close_t, h.horizon_ms, h.horizon_close,
+                       coalesce(e.bonus, 0), coalesce(e.dividend, 0),
+                       coalesce(e.rights, 0), coalesce(e.rights_cost, 0)
+                FROM base_t b JOIN horizon h ON h.thscode = b.thscode
+                LEFT JOIN events e ON e.thscode = b.thscode
+                WHERE h.horizon_close IS NOT NULL AND h.horizon_close > 0
+                ORDER BY b.thscode
+            """, [date_ms, horizon_days, horizon_days]).fetchall()
+        except duckdb.CatalogException:
+            return []
+        finally:
+            db.close()
+        keys = ("thscode", "close_t", "horizon_ms", "horizon_close",
+                "bonus", "dividend", "rights", "rights_cost")
+        return [dict(zip(keys, row)) for row in rows]
+
     def query(self, *, date_ms: int, metric: str, min_turnover: float = 0, page: int = 1, page_size: int = 100) -> dict:
         if metric not in {"breadth", "liquidity", "sample"}: raise ValueError("不支持的全市场指标。")
         if not 1 <= page <= 10000 or not 1 <= page_size <= 500: raise ValueError("分页参数不合法。")
