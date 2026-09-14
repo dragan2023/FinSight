@@ -105,6 +105,24 @@ def test_annual_rows_carry_annual_report_basis():
     assert result.records[0].period_end == "2024-12-31"
 
 
+def test_top_level_basis_is_derived_from_the_records_not_hardcoded():
+    """顶层 basis 必须跟着记录走。
+
+    此前它写死成 `BASIS_ANNUAL_REPORT`：**一次季度请求会把自己标成"年报口径"**。
+    `service._unpack` 只取 records/gaps（DataResult 的 basis 由 service 按请求参数给），
+    所以暂时没做出错误结论，但任何直接读 `result.basis` 的调用方都会被误导。
+    """
+    quarterly = {"thscode": "600519.SH", "fiscal_year": 2024, "fiscal_period": "Q3",
+                 "report_date_ms": 1730390400000, "period_end_ms": 1730390400000,
+                 "currency": "CNY", "operating_income": 100}
+    annual = {**quarterly, "fiscal_period": "FY", "fiscal_year": 2023}
+
+    assert normalize_statement_rows([quarterly], "income").basis == BASIS_QUARTERLY_UNKNOWN
+    assert normalize_statement_rows([annual], "income").basis == BASIS_ANNUAL_REPORT
+    # 混着来（年报 + 季报都在）→ 按"含年报"处理，如实标成年报口径
+    assert normalize_statement_rows([quarterly, annual], "income").basis == BASIS_ANNUAL_REPORT
+
+
 def test_price_history_normalizes_and_keeps_order():
     rows = [
         {"date_ms": 1756742400000, "close_price": 10.5, "volume": 100, "turnover": 1050},

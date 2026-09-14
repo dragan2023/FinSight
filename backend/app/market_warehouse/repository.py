@@ -227,6 +227,32 @@ class WarehouseRepository:
             total INTEGER, fetched INTEGER, pages INTEGER, page_size INTEGER,
             error_code INTEGER, error_message VARCHAR, fetched_at VARCHAR NOT NULL,
             PRIMARY KEY (date_ms, pool))""")
+        # 财务数据·point-in-time（`22` 号文档；D58–D60）。**与上面被 D9 冻结的
+        # `financial_statements` 是两回事**：那张是来源不明、只有年报、不可复现的历史快照，
+        # 这张是本轮人工同步、逐条带**披露日闸门**的新数据集。
+        # 长表（一字段一行）而不是宽表：三表字段集随标的类型变化（银行没有"营业成本"），
+        # 宽表要么大量 NULL 要么每加一个字段就迁移；长表把"缺字段"如实表达为**没有这一行**。
+        db.execute("""CREATE TABLE IF NOT EXISTS financial_facts (
+            thscode VARCHAR NOT NULL, statement VARCHAR NOT NULL, period_key VARCHAR NOT NULL,
+            period_end_ms BIGINT NOT NULL, field VARCHAR NOT NULL, value DOUBLE,
+            unit VARCHAR, currency VARCHAR,
+            disclosed_at_ms BIGINT,
+            available_from_ms BIGINT NOT NULL, available_basis VARCHAR NOT NULL,
+            api_basis VARCHAR NOT NULL, source VARCHAR NOT NULL, run_id VARCHAR NOT NULL,
+            fetched_at VARCHAR NOT NULL,
+            PRIMARY KEY (thscode, statement, period_key, field))""")
+        # 取数台账：与内容**同进同出**（`14` §6.2 第 3 条的教训——没有台账就分不清
+        # "这只标的没有数据"和"这次没取到"）。
+        db.execute("""CREATE TABLE IF NOT EXISTS financial_sync_symbols (
+            thscode VARCHAR NOT NULL, statement VARCHAR NOT NULL, status VARCHAR NOT NULL,
+            periods INTEGER, fields INTEGER, gaps INTEGER,
+            requested_start_ms BIGINT, requested_end_ms BIGINT,
+            api_basis VARCHAR, error_code INTEGER, error_message VARCHAR,
+            run_id VARCHAR NOT NULL, fetched_at VARCHAR NOT NULL,
+            PRIMARY KEY (thscode, statement))""")
+        # 数据集自证：版本、范围（universe 哈希）、窗口、口径。与事件研究面板的 meta 同一用途。
+        db.execute("""CREATE TABLE IF NOT EXISTS financial_sync_meta (
+            key VARCHAR PRIMARY KEY, value VARCHAR)""")
         # Earlier local builds assumed (thscode, ex_date_ms) was unique.  The
         # official export can contain more than one distinct action on a day;
         # preserve those events while still collapsing byte-for-byte duplicates.
@@ -764,6 +790,260 @@ class WarehouseRepository:
                     yield date_ms, grouped.get(date_ms, {})
         finally:
             db.close()
+
+    def latest_daily_ms(self) -> int | None:
+        """行情库里最后一个交易日（固定 SQL）。用于确定"最新横截面"这类范围。"""
+        if not self.path.exists():
+            return None
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            row = db.execute("SELECT max(date_ms) FROM daily_k").fetchone()
+        except duckdb.CatalogException:
+            return None
+        finally:
+            db.close()
+        return row[0] if row else None
+
+    # --- 财务数据·point-in-time（`22` 号文档 / D58–D60）-------------------------
+    def write_financial_symbol(self, *, thscode: str, statement: str, rows: list[dict],
+                               ledger: dict, meta: dict | None = None) -> None:
+        """写入一只标的的一张报表（内容 + 台账 + 可选 meta）——**同一事务**。
+
+        三条纪律（都是踩过之后写的）：
+
+        1. **显式 `commit()`**：DuckDB 在 `close()` 时回滚未提交事务，只 close 不 commit 会
+           "打印写入 N 行、读回来 0 行"（`14` §6.3 实测踩过）；
+        2. **幂等，且粒度是 `(标的, 报表)`**——一次调用替换该标的该报表的**全部报告期**。
+           这个粒度是对的：接口一次请求就返回该报表的全部期数，所以"重新同步"= 整体替换。
+           反过来，若分两次调用分别写同一报表的两个期，**第二次会抹掉第一个**（我在测试夹具里
+           就踩过：先写 2025-Q1 再写 2026-Q1，结果只剩后者）。要有测试把这条粒度钉住；
+        3. **台账与内容同进同出**：否则"没数据"和"没取到"分不开。
+        """
+        db = self._connect()
+        try:
+            db.execute("BEGIN")
+            db.execute("DELETE FROM financial_facts WHERE thscode=? AND statement=?",
+                       [thscode, statement])
+            if rows:
+                db.executemany(
+                    "INSERT INTO financial_facts(thscode, statement, period_key, period_end_ms, "
+                    "field, value, unit, currency, disclosed_at_ms, available_from_ms, "
+                    "available_basis, api_basis, source, run_id, fetched_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [(row["thscode"], row["statement"], row["period_key"], row["period_end_ms"],
+                      row["field"], row.get("value"), row.get("unit"), row.get("currency"),
+                      row.get("disclosed_at_ms"), row["available_from_ms"],
+                      row["available_basis"], row["api_basis"], row["source"], row["run_id"],
+                      row["fetched_at"]) for row in rows])
+            db.execute(
+                "INSERT OR REPLACE INTO financial_sync_symbols(thscode, statement, status, periods, "
+                "fields, gaps, requested_start_ms, requested_end_ms, api_basis, error_code, "
+                "error_message, run_id, fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [thscode, statement, ledger["status"], ledger.get("periods"),
+                 ledger.get("fields"), ledger.get("gaps"), ledger.get("requested_start_ms"),
+                 ledger.get("requested_end_ms"), ledger.get("api_basis"),
+                 ledger.get("error_code"), ledger.get("error_message"),
+                 ledger["run_id"], ledger["fetched_at"]])
+            for key, value in (meta or {}).items():
+                db.execute("INSERT OR REPLACE INTO financial_sync_meta VALUES (?, ?)",
+                           [key, str(value)])
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def write_financial_meta(self, meta: dict) -> None:
+        """写数据集自证字段（版本 / 范围哈希 / 窗口 / 口径）。与台账分开，别造假台账行。"""
+        db = self._connect()
+        try:
+            db.execute("BEGIN")
+            for key, value in meta.items():
+                db.execute("INSERT OR REPLACE INTO financial_sync_meta VALUES (?, ?)",
+                           [key, str(value)])
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def financial_facts_by_symbol(self, *, thscode: str) -> list[dict]:
+        """一只标的所有已落库的财务事实（**不过滤闸门**，用于同步自检与体检）。"""
+        if not self.path.exists():
+            return []
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            rows = db.execute(
+                "SELECT thscode, statement, period_key, period_end_ms, field, value, unit, "
+                "currency, disclosed_at_ms, available_from_ms, available_basis, api_basis, "
+                "source, run_id, fetched_at FROM financial_facts WHERE thscode=? "
+                "ORDER BY statement, period_end_ms, field", [thscode]).fetchall()
+        except duckdb.CatalogException:
+            return []
+        finally:
+            db.close()
+        keys = ("thscode", "statement", "period_key", "period_end_ms", "field", "value", "unit",
+                "currency", "disclosed_at_ms", "available_from_ms", "available_basis", "api_basis",
+                "source", "run_id", "fetched_at")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def financial_snapshot_asof(self, *, thscode: str, as_of_ms: int) -> dict:
+        """**Point-in-time 快照**：只返回 `available_from_ms <= as_of_ms` 的报告期。
+
+        返回当前期（最新可得）与**上年同季**（Δ 类信号要用同期对比：中国季报是**累计口径**
+        ——`api_basis` 记作 `quarterly_cumulative_unknown`——所以"Q3 累计 vs 上年 Q3 累计"
+        才是同一口径的同比，比"Q3 vs Q2"干净）。
+
+        **断言而非注释**（P0-4.3 的同一条纪律）：返回前逐行自检 `available_from_ms <= as_of_ms`，
+        一旦有人改了 SQL 而忘了同步闸门，这里必须炸掉，而不是静默泄漏未来信息。
+        """
+        empty = {"thscode": thscode, "as_of_ms": as_of_ms, "current": None, "previous": None,
+                 "statements": {}}
+        if not self.path.exists():
+            return empty
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            rows = db.execute("""
+                WITH cand AS (
+                    SELECT statement, period_key, period_end_ms, field, value, unit, currency,
+                           disclosed_at_ms, available_from_ms, available_basis
+                    FROM financial_facts
+                    WHERE thscode = ? AND available_from_ms <= ?
+                ), newest AS (
+                    SELECT statement, max(period_end_ms) AS period_end_ms
+                    FROM cand GROUP BY statement
+                )
+                SELECT c.statement, c.period_key, c.period_end_ms, c.field, c.value, c.unit,
+                       c.currency, c.disclosed_at_ms, c.available_from_ms, c.available_basis
+                FROM cand c JOIN newest n
+                  ON n.statement = c.statement AND n.period_end_ms = c.period_end_ms
+                ORDER BY c.statement, c.field""", [thscode, as_of_ms]).fetchall()
+        except duckdb.CatalogException:
+            return empty
+        finally:
+            db.close()
+        if not rows:
+            return empty
+        keys = ("statement", "period_key", "period_end_ms", "field", "value", "unit", "currency",
+                "disclosed_at_ms", "available_from_ms", "available_basis")
+        current = {"thscode": thscode, "period_key": None, "period_end_ms": None,
+                   "available_from_ms": None, "available_basis": None, "facts": {},
+                   "units": {}, "disclosed_at_ms": None}
+        statements: dict[str, dict] = {}
+        for row in rows:
+            item = dict(zip(keys, row))
+            if item["available_from_ms"] > as_of_ms:
+                raise ValueError(
+                    f"内部错误：{thscode} 在 as_of={as_of_ms} 返回了闸门之后的财务事实"
+                    f"（available_from={item['available_from_ms']}）——PIT 闸门被绕过即为未来信息泄漏。")
+            statements.setdefault(item["statement"], {"period_key": item["period_key"],
+                                                      "period_end_ms": item["period_end_ms"],
+                                                      "available_from_ms": item["available_from_ms"],
+                                                      "available_basis": item["available_basis"],
+                                                      "disclosed_at_ms": item["disclosed_at_ms"],
+                                                      "facts": {}})["facts"][item["field"]] = item["value"]
+            if item["field"] not in current["facts"]:
+                current["facts"][item["field"]] = item["value"]
+                current["units"][item["field"]] = item["unit"]
+        # 当前期：以**报表期最晚**的那张表为准（三表可能因闸门差异落在不同期，如实分层返回）
+        latest = max(statements.values(), key=lambda item: item["period_end_ms"])
+        current.update({key: latest[key] for key in
+                        ("period_key", "period_end_ms", "available_from_ms", "available_basis",
+                         "disclosed_at_ms")})
+        # 上年同季（若也已在闸门内）
+        year, _, quarter = str(current["period_key"]).partition("-")
+        prior_key = f"{int(year) - 1}-{quarter}" if year.isdigit() else None
+        previous = None
+        if prior_key:
+            prior_rows = [dict(zip(keys, row)) for row in
+                          self._financial_prior_rows(thscode, prior_key, as_of_ms)]
+            for item in prior_rows:
+                if item["available_from_ms"] > as_of_ms:
+                    raise ValueError(
+                        f"内部错误：{thscode} 上年同季 {prior_key} 越过了闸门。")
+            if prior_rows:
+                previous = {"thscode": thscode, "period_key": prior_key,
+                            "period_end_ms": prior_rows[0]["period_end_ms"],
+                            "available_from_ms": max(i["available_from_ms"] for i in prior_rows),
+                            "available_basis": prior_rows[0]["available_basis"],
+                            "facts": {i["field"]: i["value"] for i in prior_rows}}
+        return {"thscode": thscode, "as_of_ms": as_of_ms, "current": current,
+                "previous": previous, "statements": statements}
+
+    def _financial_prior_rows(self, thscode: str, period_key: str, as_of_ms: int) -> list[tuple]:
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            return db.execute(
+                "SELECT statement, period_key, period_end_ms, field, value, unit, currency, "
+                "disclosed_at_ms, available_from_ms, available_basis FROM financial_facts "
+                "WHERE thscode=? AND period_key=? AND available_from_ms<=? "
+                "ORDER BY statement, field", [thscode, period_key, as_of_ms]).fetchall()
+        except duckdb.CatalogException:
+            return []
+        finally:
+            db.close()
+
+    def financial_sync_ledger(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            rows = db.execute(
+                "SELECT thscode, statement, status, periods, fields, gaps, requested_start_ms, "
+                "requested_end_ms, api_basis, error_code, error_message, run_id, fetched_at "
+                "FROM financial_sync_symbols ORDER BY thscode, statement").fetchall()
+        except duckdb.CatalogException:
+            return []
+        finally:
+            db.close()
+        keys = ("thscode", "statement", "status", "periods", "fields", "gaps",
+                "requested_start_ms", "requested_end_ms", "api_basis", "error_code",
+                "error_message", "run_id", "fetched_at")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def financial_sync_meta(self) -> dict:
+        if not self.path.exists():
+            return {}
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            rows = db.execute("SELECT key, value FROM financial_sync_meta").fetchall()
+        except duckdb.CatalogException:
+            return {}
+        finally:
+            db.close()
+        return {key: value for key, value in rows}
+
+    def financial_dataset_status(self) -> dict:
+        """数据集是否可用（有内容 + 版本一致）。**不一致时必须重同步**，不许带病使用。"""
+        from .financials import FINANCIAL_PIT_VERSION
+
+        meta = self.financial_sync_meta()
+        counts = {"facts": 0, "symbols": 0, "statements": 0, "periods": 0}
+        if self.path.exists():
+            db = duckdb.connect(str(self.path), read_only=True)
+            try:
+                row = db.execute(
+                    "SELECT count(*), count(DISTINCT thscode), count(DISTINCT statement), "
+                    "count(DISTINCT period_key) FROM financial_facts").fetchone()
+                counts = {"facts": row[0], "symbols": row[1], "statements": row[2],
+                          "periods": row[3]}
+                ledger = db.execute(
+                    "SELECT count(*), sum(CASE WHEN status IN ('available','partial') THEN 1 ELSE 0 END) "
+                    "FROM financial_sync_symbols").fetchone()
+                counts["ledger_rows"] = ledger[0]
+                counts["ledger_ok"] = ledger[1] or 0
+            except duckdb.CatalogException:
+                pass
+            finally:
+                db.close()
+        version = meta.get("version", "")
+        stale = "" if (counts["facts"] and version == FINANCIAL_PIT_VERSION) else (
+            "没有财务数据：先跑 scripts/sync_financials.py（人工触发）" if not counts["facts"]
+            else f"数据集版本 {version or '（缺失）'} != {FINANCIAL_PIT_VERSION}")
+        return {"ready": not stale, "reason": stale, "version": version, "counts": counts,
+                "meta": meta}
 
     # --- 涨跌停/炸板池 -------------------------------------------------------
     def write_limit_pool_day(self, *, date_ms: int, pool: str, rows: list[dict],

@@ -12,6 +12,23 @@ def _number(values: Mapping[str, object], key: str) -> float | None:
         return None
 
 
+def _roa(values: Mapping[str, object]) -> float | None:
+    """资产回报率：优先用**本地口径** `roa`，回退到厂商指标 `total_assets_net_ratio`。
+
+    两个口径不是同一个东西，因此**不合并成一个键**：
+
+    - `roa`（本地，`market_warehouse/financials.py`）：净利润 ÷ **期末**资产总计，
+      只有三表就能算，且带披露日 → 可用于历史 point-in-time；
+    - `total_assets_net_ratio`（厂商 `indicators`）：实测与本地口径**相对差 <1%**，
+      差值方向一致（厂商看起来用**平均**总资产），但它**不带披露日**，只能用于当前时点。
+
+    优先本地口径的理由：它自证（公式与来源都在我们自己手里），而不是拿一个无法追溯
+    披露时点的外部数字。回退厂商口径是为了不破坏顾问链既有调用方式。
+    """
+    local = _number(values, "roa")
+    return local if local is not None else _number(values, "total_assets_net_ratio")
+
+
 def calculate_f_score(current: Mapping[str, object], previous: Mapping[str, object],
                       *, evidence_id: str = "F1") -> dict:
     """计算九项卡片；增发数据不可得时固定为 N/A，不将缺口误当作零。"""
@@ -24,8 +41,8 @@ def calculate_f_score(current: Mapping[str, object], previous: Mapping[str, obje
             "available_items": 0, "total_items": 9, "items": [], "eligible": False,
             "note": f"{reason}不适用 F-Score 比较，已按研究口径剔除。",
         }
-    roa = _number(current, "total_assets_net_ratio")
-    previous_roa = _number(previous, "total_assets_net_ratio")
+    roa = _roa(current)
+    previous_roa = _roa(previous)
     cfo = _number(current, "act_cash_flow_net")
     assets = _number(current, "assets_total")
     cfo_roa = cfo / assets if cfo is not None and assets not in (None, 0) else None

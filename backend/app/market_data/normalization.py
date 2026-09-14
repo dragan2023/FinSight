@@ -195,7 +195,14 @@ def normalize_statement_rows(rows: list[dict], statement: str) -> NormalizationR
             basis=BASIS_ANNUAL_REPORT if annual else BASIS_QUARTERLY_UNKNOWN,
             currency=currency, fields=fields))
     records.sort(key=lambda record: record.period_key, reverse=True)
-    return NormalizationResult(domain=dimension, basis=BASIS_ANNUAL_REPORT, records=records,
+    # 顶层 basis 必须**由记录推出来**，不能写死。写死成 `BASIS_ANNUAL_REPORT` 会让一次
+    # **季度**请求把自己标成"年报口径"——目前 `service._unpack` 只取 records/gaps、
+    # 顶层 basis 被丢弃（DataResult 的 basis 由 service 按请求参数给），所以它暂时没造成
+    # 错误结论，但任何直接读它的调用方都会被误导。这里按"有没有 FY 行"如实推导。
+    basis = (BASIS_ANNUAL_REPORT
+             if any(record.basis == BASIS_ANNUAL_REPORT for record in records)
+             else BASIS_QUARTERLY_UNKNOWN)
+    return NormalizationResult(domain=dimension, basis=basis, records=records,
                                gaps=gaps, duplicate_versions=duplicates)
 
 
