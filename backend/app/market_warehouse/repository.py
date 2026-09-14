@@ -884,6 +884,29 @@ class WarehouseRepository:
             db.close()
         return [row[0] for row in rows]
 
+    def daily_bar_extras(self, *, thscode: str, start_ms: int = 0,
+                         end_ms: int) -> dict[int, dict]:
+        """原始日 K 的**最低价/最高价/成交额**（固定 SQL）——风控层要用（止损、流动性门槛）。
+
+        ⚠️ 返回的是**未复权**原值。调用方必须把它们缩放到与复权序列同一空间再比较
+        （`strategy.local_bars` 用「复权收盘 ÷ 原始收盘」做乘性缩放），否则除权日附近的
+        止损判断会被机械跳空骗到——与 `19` 号文档修掉的配股口径是同一类错误。
+        成交额是**金额**、不随复权缩放，用原值即可。
+        """
+        if not self.path.exists() or end_ms < start_ms:
+            return {}
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            rows = db.execute(
+                "SELECT date_ms, low_price, high_price, turnover FROM daily_k "
+                "WHERE thscode=? AND date_ms>=? AND date_ms<=? ORDER BY date_ms",
+                [thscode, start_ms, end_ms]).fetchall()
+        except duckdb.CatalogException:
+            return {}
+        finally:
+            db.close()
+        return {row[0]: {"low": row[1], "high": row[2], "turnover": row[3]} for row in rows}
+
     def financial_facts_all(self) -> list[dict]:
         """整表读回财务事实（**不**在这里做 PIT 选择）。
 

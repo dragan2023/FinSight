@@ -1,4 +1,4 @@
-from .models import StrategySpec
+from .models import RiskProfile, StrategySpec
 
 _SPECS = {
  "buy_hold_v1": StrategySpec(id="buy_hold_v1", version="v1", name="买入持有基准", family="benchmark", asset_types=["a-share"], horizon="长期", required_fields=["open_price","close_price"], warmup_bars=1, parameters={}, signal_rule="首个可执行开盘后持续持有", exit_rule="实验结束", risk_rule="无", cost_basis="单边成本假设", benchmark_id="buy_hold_v1", applicability="仅作比较", contraindications="不得作为推荐策略", research_sources=[], lifecycle="experimental"),
@@ -8,3 +8,44 @@ _SPECS = {
 }
 def list_specs(): return list(_SPECS.values())
 def get_spec(strategy_id: str) -> StrategySpec: return _SPECS[strategy_id]
+
+
+#: **风控档位**（用户 2026-09-15 定下的验收偏好：最大回撤 20% / 单年最差 −10% /
+#: 回撤最长持续 12 个月 / 单笔最大风险 1%）。档位是**声明式**的：跑任何策略都可以
+#: 挂不同档位做对比，风控与信号因此解耦。
+_RISK_PROFILES = {
+    # 基准档：什么都不拦。用于回答"风控到底起了多大作用"（对照组必须有）。
+    "risk_none_v1": RiskProfile(id="risk_none_v1", name="无风控（对照基准）"),
+    # 保守档：按用户给的容忍度反推——止损 8%，单票最多 25%，回撤超 20% 停止开新仓，
+    # 成交额低于 1 亿不碰，涨停开盘不买、跌停不卖，并叠加既有波动率闸门。
+    "risk_conservative_v1": RiskProfile(
+        id="risk_conservative_v1", name="保守档（止损 8% + 回撤熔断 20% + 流动性 1 亿）",
+        stop_loss_pct=0.08, drawdown_breaker_pct=0.20, min_turnover=1.0e8,
+        limit_move_pct=0.095, volatility_gate=True),
+    # 宽止损档：只拦最坏情况（止损放到 15%、熔断 30%），用来判断"紧止损是不是在砍掉收益"。
+    "risk_loose_v1": RiskProfile(
+        id="risk_loose_v1", name="宽档（止损 15% + 回撤熔断 30%）",
+        stop_loss_pct=0.15, drawdown_breaker_pct=0.30, min_turnover=1.0e8,
+        limit_move_pct=0.095, volatility_gate=True),
+}
+
+
+def list_risk_profiles() -> list[RiskProfile]:
+    return list(_RISK_PROFILES.values())
+
+
+def get_risk_profile(profile_id: str) -> RiskProfile:
+    return _RISK_PROFILES[profile_id]
+
+
+def risk_gate(profile: RiskProfile | None) -> dict:
+    """把风控档位里**与特征计算有关**的部分转成 `feature_rows` 的参数。
+
+    只有波动率闸门需要在特征层生效（它决定 `vol_gate` 是否存在）；其余规则都在
+    回测主循环里逐 bar 判断，因为它们依赖**当时**的净值与成交价。
+    """
+    if profile is None or not profile.volatility_gate:
+        return {}
+    spec = _SPECS["volatility_gate_v1"].parameters
+    return {"vol_window": spec["vol_window"], "vol_history": spec["vol_history"],
+            "vol_quantile": spec["vol_quantile"]}

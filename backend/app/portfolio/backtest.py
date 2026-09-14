@@ -66,17 +66,21 @@ def _bars_by_date(target: PortfolioTarget) -> dict[str, PriceBar]:
 
 def _active_strategy_map(
     targets: list[PortfolioTarget], strategy_ids: list[str], *, one_way_cost_bps: int,
-    gate: dict | None,
-) -> dict[str, dict[str, set[str]]]:
-    """返回 ``交易日 -> 标的 -> 当前已执行策略``，不读取未来数据。"""
+    gate: dict | None, risk=None,
+) -> tuple[dict[str, dict[str, set[str]]], dict]:
+    """返回 ``(交易日 -> 标的 -> 当前已执行策略, 风控统计合计)``，不读取未来数据。"""
     daily: dict[str, dict[str, set[str]]] = {}
+    totals: dict[str, int] = {}
     for target in targets:
         for strategy_id in strategy_ids:
-            curve = run_backtest(strategy_id, target.bars, one_way_cost_bps, gate=gate)["curve"]
-            for point in curve:
+            result = run_backtest(strategy_id, target.bars, one_way_cost_bps, gate=gate,
+                                  risk=risk)
+            for key, value in (result.get("risk_stats") or {}).items():
+                totals[key] = totals.get(key, 0) + int(value)
+            for point in result["curve"]:
                 if point.get("position"):
                     daily.setdefault(str(point["period"]), {}).setdefault(target.thscode, set()).add(strategy_id)
-    return daily
+    return daily, totals
 
 
 def _metrics(curve: list[dict], *, trade_count: int) -> dict:
@@ -140,10 +144,13 @@ def run_portfolio_backtest(
     max_industry_weight: float,
     analysis_start_date: str | None = None,
     gate: dict | None = None,
+    risk=None,
 ) -> dict:
     """按日滚动配置研究组合；无信号或触及上限后不强行买入。
 
-    返回的 ``daily_candidates`` 是审计资料：可复核为什么某天买入、为什么留现金。
+    `risk` 是 `strategy.models.RiskProfile`：逐标的回放时就地生效（止损/熔断/流动性/涨跌停
+    不可成交），因此组合层拿到的仓位已经是**风控后**的仓位。返回的 ``daily_candidates``
+    是审计资料：可复核为什么某天买入、为什么留现金。
     """
     if not targets:
         raise ValueError("组合至少需要一个标的。")
@@ -157,13 +164,24 @@ def run_portfolio_backtest(
         raise ValueError("标的之间缺少足够的共同可交易日。")
     target_by_code = {item.thscode: item for item in targets}
     price_maps = {item.thscode: _bars_by_date(item) for item in targets}
-    active = _active_strategy_map(targets, strategy_ids, one_way_cost_bps=one_way_cost_bps, gate=gate)
+    active, risk_totals = _active_strategy_map(targets, strategy_ids,
+                                               one_way_cost_bps=one_way_cost_bps,
+                                               gate=gate, risk=risk)
     cost_rate = one_way_cost_bps / 10_000
     cash = 1.0
     holdings: dict[str, float] = {}
     curve: list[dict] = []
     trades: list[dict] = []
     daily_candidates: list[dict] = []
+    # 组合级回撤熔断：**只有这里才有组合净值**，所以它必须在这一层实现。
+    # 恢复用**时间界**（暂停 N 个交易日后自动恢复），不用"回撤收敛到一半"——
+    # 后者会死锁：暂停期间空仓、净值不动、回撤永远不收敛（单标的层实测踩到过）。
+    breaker = getattr(risk, "drawdown_breaker_pct", None) if risk is not None else None
+    breaker_cooldown = int(getattr(risk, "breaker_cooldown_days", 20)) if risk is not None else 0
+    peak = 1.0
+    pause_left = 0
+    risk_stats = dict(risk_totals)
+    risk_stats.update({"breaker_triggers": 0, "breaker_pause_days": 0})
 
     for index, day in enumerate(dates):
         if index:
@@ -175,14 +193,32 @@ def run_portfolio_backtest(
                 holdings[code] = value * opening / previous_close
 
         pre_trade_equity = cash + sum(holdings.values())
+        peak = max(peak, pre_trade_equity)
+        # 熔断判断：用**今开的组合净值**与历史峰值比（不含当天之后的信息）
+        if breaker is not None:
+            if pause_left > 0:
+                pause_left -= 1
+                risk_stats["breaker_pause_days"] += 1
+            elif peak and pre_trade_equity / peak - 1 <= -breaker:
+                pause_left = max(0, breaker_cooldown - 1)
+                risk_stats["breaker_triggers"] += 1
+                risk_stats["breaker_pause_days"] += 1
+        paused = pause_left > 0
         candidates = []
         for code, active_ids in active.get(day, {}).items():
             target = target_by_code[code]
             candidates.append({"thscode": code, "name": target.name, "industry": target.industry,
                                "strategy_ids": sorted(active_ids), "score": len(active_ids)})
-        target_weights = allocate_candidates(
-            candidates, max_positions=max_positions, max_single_weight=max_single_weight,
-            max_industry_weight=max_industry_weight)
+        if paused:
+            # 暂停期语义：**不开新仓、已持仓的仍在信号内的按原值留着**（不调仓、不加仓）；
+            # 信号已消失的照常退出（那是止损/止盈的正常路径，不该被熔断冻住）。
+            kept = {code: value for code, value in holdings.items() if code in active.get(day, {})}
+            target_weights = ({code: value / pre_trade_equity for code, value in kept.items()}
+                              if pre_trade_equity else {})
+        else:
+            target_weights = allocate_candidates(
+                candidates, max_positions=max_positions, max_single_weight=max_single_weight,
+                max_industry_weight=max_industry_weight)
         target_values = {code: pre_trade_equity * weight for code, weight in target_weights.items()}
         turnover = sum(abs(target_values.get(code, 0.0) - holdings.get(code, 0.0))
                        for code in set(target_values) | set(holdings))
@@ -226,5 +262,7 @@ def run_portfolio_backtest(
             portfolio_metrics["cumulative_return_pct"] - equal_metrics["cumulative_return_pct"], 4),
                        "excess_vs_cash_pct": portfolio_metrics["cumulative_return_pct"]},
         "research_only": True,
+        "risk_profile": None if risk is None else getattr(risk, "id", None),
+        "risk_stats": risk_stats,
         "production_eligibility": "none：本回放不改变策略候选门禁或顾问生产建议。",
     }

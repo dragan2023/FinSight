@@ -1,7 +1,8 @@
 from __future__ import annotations
 import math
 from .features import feature_rows
-from .models import PriceBar
+from .models import PriceBar, RiskProfile
+from .registry import risk_gate
 
 def current_signal_snapshot(strategy_id: str, bars: list[PriceBar], *, gate: dict | None = None) -> dict:
     """用最新已完成 K 线生成下一交易日的确定性策略信号，不调用模型。"""
@@ -51,49 +52,146 @@ def current_signal_snapshot(strategy_id: str, bars: list[PriceBar], *, gate: dic
             "volatility_gate_passed": bool(gate_ok),
             "basis": "latest_completed_forward_adjusted_daily_bar"}
 
-def run_backtest(strategy_id: str, bars: list[PriceBar], cost_bps: int, *, gate: dict | None = None) -> dict:
-    features=feature_rows(bars, **(gate or {})); position=0; entry=None; held=0; cash=1.0; benchmark=1.0; peak=1.0; trades=[]; curve=[]; costs=cost_bps/10000
+def run_backtest(strategy_id: str, bars: list[PriceBar], cost_bps: int, *,
+                 gate: dict | None = None, risk: RiskProfile | None = None) -> dict:
+    """单标的、无前视的回放；`risk` 挂风控档位（`None` = 与历史行为**逐位一致**）。
+
+    执行模型（自 `11` 号文档 F23 起就固定）：**信号在 i−1 收盘后形成，最早只能在 i 的开盘成交**，
+    并且换手当日按成交价盯市。风控层在此之上加四类拦截，每条都写明它拦的是什么：
+
+    | 规则 | 拦什么 | 实现在哪 |
+    |---|---|---|
+    | 单笔止损 | 一笔亏到止损线就走 | 阶段 2（用当日 `low` 判断，跳空则按开盘价成交） |
+    | 流动性门槛 | 入场当日成交额不足就不买（买不到撮合不了的票） | 阶段 1 入场分支 |
+    | 涨跌停不可成交 | 开盘跳空到涨停 → 买不进；跳空到跌停 → 卖不出（**止损也成交不了**） | 阶段 1 与阶段 2 |
+
+    ⚠️ **回撤熔断刻意不在这里实现**：用户给的 20% 是**组合**口径的回撤，而本函数只有单标的
+    净值。曾经把它写在单标的层，后果实测是**死锁**——熔断后空仓、净值不动、回撤永远不收敛，
+    于是该标的从某年起彻底停止交易（2023–2026 逐年收益全是 0.00%）。组合级回撤熔断在
+    `portfolio.backtest` 里实现（那里才有组合净值），并且用**时间界**而不是水平界来恢复。
+
+    ⚠️ **日线回测的固有近似**：止损成交价用「`min(开盘价, 止损价)`」是**假设**——真实盘中路径
+    不可知，急跌时实际成交可能更差。这一条无法靠代码消除，只能如实登记（见 `25` 号文档）。
+    """
+    kwargs = dict(gate or {})
+    kwargs.update(risk_gate(risk))
+    features = feature_rows(bars, **kwargs)
+    costs = cost_bps / 10000
+    position = 0; entry = None; held = 0; cash = 1.0; benchmark = 1.0; peak = 1.0
+    trades: list[dict] = []; curve: list[dict] = []
+    breaker_active = False
+    cooldown = 0
+    stats = {"stop_exits": 0, "blocked_entries_limit_up": 0, "blocked_exits_limit_down": 0,
+             "skipped_entries_liquidity": 0, "skipped_entries_missing_turnover": 0,
+             "skipped_entries_cooldown": 0, "entries": 0}
+    limit = risk.limit_move_pct if risk is not None else None
+    stop_pct = risk.stop_loss_pct if risk is not None else None
+    min_turnover = risk.min_turnover if risk is not None else None
+    cooldown_days = risk.reentry_cooldown_days if risk is not None else 0
+
     for i, bar in enumerate(bars):
-        # 信号在 i-1 收盘后形成，最早只能在 i 的开盘成交——净值曲线必须与这个执行
-        # 模型**一致**：换手当日按成交价（开盘）盯市，而不是按「前收→收盘」的整段涨跌。
-        # 旧实现在换手当日沿用 close_i/close_{i-1}，等于按前收成交却只按开盘扣成本，
-        # 有跳空时开仓偏乐观、平仓漏掉隔夜变动，而且与 trades[].return_pct（open→open）
-        # 互相矛盾。**无跳空时两种算法恰好相同**，所以这个缺陷长期没被发现。
-        execute = i>0 and bars[i].open is not None
-        previous=features[i-1] if i else {}
-        desired=0
+        execute = i > 0 and bar.open is not None
+        previous = features[i - 1] if i else {}
+        prev_close = bars[i - 1].close if i else None
+        held_before = position
+        entered_today = False
+        desired = 0
+
+        # --- 信号（用 i−1 的信息，绝不用当天） ---
         if i:
-            gate_ok = previous.get("vol") is None or previous.get("vol_gate") is None or previous["vol"] <= previous["vol_gate"]
-            if strategy_id=="trend_20_60_v1": desired=int(bool(previous.get("ma20") and previous.get("ma60") and bars[i-1].close>previous["ma20"]>previous["ma60"]))
+            gate_ok = (previous.get("vol") is None or previous.get("vol_gate") is None
+                       or previous["vol"] <= previous["vol_gate"])
+            if strategy_id == "trend_20_60_v1":
+                desired = int(bool(previous.get("ma20") and previous.get("ma60")
+                                   and bars[i - 1].close > previous["ma20"] > previous["ma60"]))
             else:
-                desired = int(held < 5) if position else int(bool(previous.get("ret5_q10") is not None and previous.get("ret5") is not None and previous["ret5"]<=previous["ret5_q10"] and previous.get("ma60") and bars[i-1].close>previous["ma60"]))
-            if not gate_ok and not position: desired=0
-        # `desired != position` 时恰好只有一支分支会执行（旧代码同样如此）。
+                desired = (int(held < 5) if position else int(bool(
+                    previous.get("ret5_q10") is not None and previous.get("ret5") is not None
+                    and previous["ret5"] <= previous["ret5_q10"]
+                    and previous.get("ma60") and bars[i - 1].close > previous["ma60"])))
+            if not gate_ok and not position:
+                desired = 0
+
+        # --- 阶段 1：开盘时点（退出 / 入场） ---
         if execute and desired != position and position:
-            # 先按开盘价把已有仓位盯市到成交时点，再扣平仓成本。
-            cash *= bar.open/bars[i-1].close
-            cash *= (1-costs)
-            trades[-1]["exit_date"] = bar.date
-            trades[-1]["exit_price"] = bar.open
-            trades[-1]["return_pct"] = round(((bar.open / entry) * (1-costs) ** 2 - 1) * 100, 4)
-            position=0; held=0
+            if limit is not None and _gapped(bar.open, prev_close, limit, down=True):
+                stats["blocked_exits_limit_down"] += 1      # 跌停卖不掉，仓位留着
+            else:
+                cash *= bar.open / prev_close
+                cash *= (1 - costs)
+                trades[-1].update({"exit_date": bar.date, "exit_price": bar.open,
+                                   "exit_reason": "signal",
+                                   "return_pct": round(((bar.open / entry) * (1 - costs) ** 2 - 1) * 100, 4)})
+                position = 0; held = 0
         elif execute and desired != position and desired:
-            cash *= (1-costs)                 # 开仓成本按开盘成交价计
-            position=1; entry=bar.open; held=0
-            trades.append({"entry_date":bar.date,"entry_price":bar.open})
-            cash *= bar.close/bar.open        # 从成交价盯市到当日收盘
-        elif i and position:
-            cash *= bar.close/bars[i-1].close
+            blocked = False
+            if limit is not None and _gapped(bar.open, prev_close, limit, down=False):
+                blocked = True; stats["blocked_entries_limit_up"] += 1
+            if not blocked and cooldown > 0:
+                blocked = True; stats["skipped_entries_cooldown"] += 1
+            if not blocked and min_turnover is not None and bar.turnover is not None \
+                    and bar.turnover < min_turnover:
+                blocked = True; stats["skipped_entries_liquidity"] += 1
+            if not blocked and min_turnover is not None and bar.turnover is None:
+                # 成交额缺失时不假装它达标：宁可不买（并计入统计，可复核）
+                blocked = True; stats["skipped_entries_missing_turnover"] += 1
+            if not blocked:
+                cash *= (1 - costs)
+                position = 1; entry = bar.open; held = 0; entered_today = True
+                stats["entries"] += 1
+                trades.append({"entry_date": bar.date, "entry_price": bar.open})
+
+        # --- 阶段 2：持仓时点的盯市（止损在这层判断） ---
+        if position:
+            base = bar.open if entered_today else prev_close
+            stopped = False
+            if stop_pct is not None and bar.low is not None:
+                stop_price = entry * (1 - stop_pct)
+                if bar.low <= stop_price:
+                    if limit is not None and _gapped(bar.open, prev_close, limit, down=True):
+                        # 跌停封死：止损单也卖不出去，只能继续持有（如实计数）
+                        stats["blocked_exits_limit_down"] += 1
+                    else:
+                        fill = min(bar.open, stop_price) if bar.open is not None else stop_price
+                        cash *= fill / base
+                        cash *= (1 - costs)
+                        trades[-1].update({"exit_date": bar.date, "exit_price": fill,
+                                           "exit_reason": "stop",
+                                           "return_pct": round(((fill / entry) * (1 - costs) ** 2 - 1) * 100, 4)})
+                        stats["stop_exits"] += 1
+                        position = 0; held = 0; cooldown = cooldown_days
+                        stopped = True
+            if not stopped:
+                cash *= bar.close / base
+
+        if cooldown > 0:
+            cooldown -= 1
         if i and position: held += 1
-        if i: benchmark *= bar.close/bars[i-1].close
-        peak=max(peak,cash); curve.append({"period":bar.date,"net_value":round(cash,6),"benchmark_net_value":round(benchmark,6),"drawdown_pct":round((cash/peak-1)*100,4),"position":position})
+        if i: benchmark *= bar.close / bars[i - 1].close
+        peak = max(peak, cash)
+        curve.append({"period": bar.date, "net_value": round(cash, 6),
+                      "benchmark_net_value": round(benchmark, 6),
+                      "drawdown_pct": round((cash / peak - 1) * 100, 4), "position": position})
+
     if position and trades:
         # 回测末日的持仓仅按收盘盯市，不假定为了展示指标而额外平仓；因此只
         # 计入已经发生的开仓成本，避免把并未执行的未来卖出成本混进历史结果。
         trades[-1]["exit_date"] = bars[-1].date
         trades[-1]["exit_price"] = bars[-1].close
-        trades[-1]["return_pct"] = round(((bars[-1].close / entry) * (1-costs) - 1) * 100, 4)
-    return {"curve":curve,"trades":trades}
+        trades[-1]["exit_reason"] = trades[-1].get("exit_reason") or "end_of_sample"
+        trades[-1]["return_pct"] = round(((bars[-1].close / entry) * (1 - costs) - 1) * 100, 4)
+    return {"curve": curve, "trades": trades, "risk_stats": stats,
+            "risk_profile": None if risk is None else risk.id}
+
+
+def _gapped(open_price: float | None, prev_close: float | None, limit: float,
+            *, down: bool) -> bool:
+    """开盘是否已跳到涨/跌停附近（跳到那儿就**按开盘价成交不了**）。"""
+    if open_price is None or not prev_close:
+        return False
+    move = open_price / prev_close - 1
+    return move <= -limit if down else move >= limit
+
 
 def metrics(curve: list[dict], trades: list[dict]) -> dict:
     if len(curve)<2: return {}
