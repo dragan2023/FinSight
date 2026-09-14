@@ -309,6 +309,20 @@ class ScreenerService:
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
     # --- 因子评价：Rank IC 与安慰剂 ---------------------------------------
+    def eligible_rows(self, date_ms: int, *, rules: UniverseRules | None = None,
+                      ledger: dict[int, dict] | None = None) -> tuple[list[dict], dict, object]:
+        """当日通过既有股票池规则的横截面行 + 诊断 + 涨停口径证据。
+
+        **公开出来是为了让别的评价（如财务因子 IC）复用同一套池规则**：规则各写一遍
+        必然漂移（本仓库已为"同源两处"付过代价，见 `19` 号文档的配股口径）。
+        """
+        rules = rules or UniverseRules()
+        raw = self._repository.cross_section(date_ms=date_ms)
+        limit_up = self._limit_up_evidence(date_ms, rules, ledger=ledger)
+        diagnostics: dict = {}
+        kept, _ = apply_rules(raw, rules, limit_up=limit_up, diagnostics=diagnostics)
+        return kept, diagnostics, limit_up
+
     def ic_for_date(self, date_ms: int, *, horizon_days: int = 20,
                     rules: UniverseRules | None = None,
                     factor_ids: tuple[str, ...] = FACTOR_IDS,
@@ -327,10 +341,7 @@ class ScreenerService:
         显著性一律由 `ic_report` 里的 **IC 时间序列 t 值**给出。
         """
         rules = rules or UniverseRules()
-        raw = self._repository.cross_section(date_ms=date_ms)
-        limit_up = self._limit_up_evidence(date_ms, rules, ledger=ledger)
-        diagnostics: dict = {}
-        kept, _ = apply_rules(raw, rules, limit_up=limit_up, diagnostics=diagnostics)
+        kept, diagnostics, limit_up = self.eligible_rows(date_ms, rules=rules, ledger=ledger)
         basis = {"basis": limit_up.basis, "reason": limit_up.reason,
                  "sync_status": limit_up.sync_status, "pool_size": diagnostics["pool_size"],
                  "proxy_only_kept": diagnostics["proxy_only"],

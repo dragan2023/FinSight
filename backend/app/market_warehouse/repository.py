@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 import duckdb
 from .schema import ADJUSTMENT_FACTOR_COLUMNS, DAILY_COLUMNS, FROZEN_READONLY_DATASETS
+from .financials import (group_periods, select_common_period,
+                         select_prior_year_facts)
 
 #: 事件研究**预计算面板**的版本号。改了下面的 SQL 就要改它——否则旧缓存会被当成新口径用。
 #: v5：新增**可成交口径**列（`next_open` / `forward_return_next_open` /
@@ -854,6 +856,57 @@ class WarehouseRepository:
         finally:
             db.close()
 
+    def month_end_trading_days(self, *, start_ms: int | None = None,
+                               end_ms: int | None = None) -> list[int]:
+        """每个自然月的**最后一个交易日**（固定 SQL）。月度横截面评价的采样点。"""
+        if not self.path.exists():
+            return []
+        clauses, params = [], []
+        if start_ms is not None:
+            clauses.append("date_ms >= ?")
+            params.append(start_ms)
+        if end_ms is not None:
+            clauses.append("date_ms <= ?")
+            params.append(end_ms)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            rows = db.execute(f"""
+                WITH days AS (SELECT DISTINCT date_ms FROM daily_k {where}),
+                labelled AS (
+                    SELECT date_ms, strftime(to_timestamp(date_ms / 1000), '%Y-%m') AS month
+                    FROM days)
+                SELECT max(date_ms) FROM labelled GROUP BY month ORDER BY 1""",
+                params).fetchall()
+        except duckdb.CatalogException:
+            return []
+        finally:
+            db.close()
+        return [row[0] for row in rows]
+
+    def financial_facts_all(self) -> list[dict]:
+        """整表读回财务事实（**不**在这里做 PIT 选择）。
+
+        一次查询约 18 万行（本机实测），PIT 选择交给 `financials.select_common_period`
+        这类纯函数——把"哪一期可见、各表是否齐备"的逻辑放在可单测的地方，而不是散在 SQL 里。
+        """
+        if not self.path.exists():
+            return []
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            rows = db.execute(
+                "SELECT thscode, statement, period_key, period_end_ms, field, value, unit, "
+                "available_from_ms, available_basis FROM financial_facts "
+                "ORDER BY thscode, statement, period_end_ms").fetchall()
+        except duckdb.CatalogException:
+            return []
+        finally:
+            db.close()
+        keys = ("thscode", "statement", "period_key", "period_end_ms", "field", "value", "unit",
+                "available_from_ms", "available_basis")
+        return [dict(zip(keys, row)) for row in rows]
+
+
     def write_financial_meta(self, meta: dict) -> None:
         """写数据集自证字段（版本 / 范围哈希 / 窗口 / 口径）。与台账分开，别造假台账行。"""
         db = self._connect()
@@ -890,100 +943,44 @@ class WarehouseRepository:
         return [dict(zip(keys, row)) for row in rows]
 
     def financial_snapshot_asof(self, *, thscode: str, as_of_ms: int) -> dict:
-        """**Point-in-time 快照**：只返回 `available_from_ms <= as_of_ms` 的报告期。
+        """**Point-in-time 快照**（单标的）：只返回 `available_from_ms <= as_of_ms` 的报告期。
 
-        返回当前期（最新可得）与**上年同季**（Δ 类信号要用同期对比：中国季报是**累计口径**
-        ——`api_basis` 记作 `quarterly_cumulative_unknown`——所以"Q3 累计 vs 上年 Q3 累计"
-        才是同一口径的同比，比"Q3 vs Q2"干净）。
+        当前期取「**各张报表都已披露**的最近报告期」（`financials.select_common_period`）——
+        三表披露节奏不同，按"全体最大期"取会把利润表 Q2 与资产负债表 Q1 拼到一起，
+        比率的分子分母就跨期了（本轮实测踩到的陷阱）。
 
-        **断言而非注释**（P0-4.3 的同一条纪律）：返回前逐行自检 `available_from_ms <= as_of_ms`，
-        一旦有人改了 SQL 而忘了同步闸门，这里必须炸掉，而不是静默泄漏未来信息。
+        **断言而非注释**：选定后再逐行自检闸门，一旦有人改了选择逻辑，这里必须炸掉，
+        而不是静默泄漏未来信息。
         """
         empty = {"thscode": thscode, "as_of_ms": as_of_ms, "current": None, "previous": None,
                  "statements": {}}
-        if not self.path.exists():
-            return empty
-        db = duckdb.connect(str(self.path), read_only=True)
-        try:
-            rows = db.execute("""
-                WITH cand AS (
-                    SELECT statement, period_key, period_end_ms, field, value, unit, currency,
-                           disclosed_at_ms, available_from_ms, available_basis
-                    FROM financial_facts
-                    WHERE thscode = ? AND available_from_ms <= ?
-                ), newest AS (
-                    SELECT statement, max(period_end_ms) AS period_end_ms
-                    FROM cand GROUP BY statement
-                )
-                SELECT c.statement, c.period_key, c.period_end_ms, c.field, c.value, c.unit,
-                       c.currency, c.disclosed_at_ms, c.available_from_ms, c.available_basis
-                FROM cand c JOIN newest n
-                  ON n.statement = c.statement AND n.period_end_ms = c.period_end_ms
-                ORDER BY c.statement, c.field""", [thscode, as_of_ms]).fetchall()
-        except duckdb.CatalogException:
-            return empty
-        finally:
-            db.close()
+        rows = [row for row in self.financial_facts_all() if row["thscode"] == thscode]
         if not rows:
             return empty
-        keys = ("statement", "period_key", "period_end_ms", "field", "value", "unit", "currency",
-                "disclosed_at_ms", "available_from_ms", "available_basis")
-        current = {"thscode": thscode, "period_key": None, "period_end_ms": None,
-                   "available_from_ms": None, "available_basis": None, "facts": {},
-                   "units": {}, "disclosed_at_ms": None}
-        statements: dict[str, dict] = {}
-        for row in rows:
-            item = dict(zip(keys, row))
-            if item["available_from_ms"] > as_of_ms:
-                raise ValueError(
-                    f"内部错误：{thscode} 在 as_of={as_of_ms} 返回了闸门之后的财务事实"
-                    f"（available_from={item['available_from_ms']}）——PIT 闸门被绕过即为未来信息泄漏。")
-            statements.setdefault(item["statement"], {"period_key": item["period_key"],
-                                                      "period_end_ms": item["period_end_ms"],
-                                                      "available_from_ms": item["available_from_ms"],
-                                                      "available_basis": item["available_basis"],
-                                                      "disclosed_at_ms": item["disclosed_at_ms"],
-                                                      "facts": {}})["facts"][item["field"]] = item["value"]
-            if item["field"] not in current["facts"]:
-                current["facts"][item["field"]] = item["value"]
-                current["units"][item["field"]] = item["unit"]
-        # 当前期：以**报表期最晚**的那张表为准（三表可能因闸门差异落在不同期，如实分层返回）
-        latest = max(statements.values(), key=lambda item: item["period_end_ms"])
-        current.update({key: latest[key] for key in
-                        ("period_key", "period_end_ms", "available_from_ms", "available_basis",
-                         "disclosed_at_ms")})
-        # 上年同季（若也已在闸门内）
-        year, _, quarter = str(current["period_key"]).partition("-")
-        prior_key = f"{int(year) - 1}-{quarter}" if year.isdigit() else None
-        previous = None
-        if prior_key:
-            prior_rows = [dict(zip(keys, row)) for row in
-                          self._financial_prior_rows(thscode, prior_key, as_of_ms)]
-            for item in prior_rows:
-                if item["available_from_ms"] > as_of_ms:
-                    raise ValueError(
-                        f"内部错误：{thscode} 上年同季 {prior_key} 越过了闸门。")
-            if prior_rows:
-                previous = {"thscode": thscode, "period_key": prior_key,
-                            "period_end_ms": prior_rows[0]["period_end_ms"],
-                            "available_from_ms": max(i["available_from_ms"] for i in prior_rows),
-                            "available_basis": prior_rows[0]["available_basis"],
-                            "facts": {i["field"]: i["value"] for i in prior_rows}}
+        leaked = [row for row in rows if row["available_from_ms"] <= as_of_ms
+                  and row["available_from_ms"] > as_of_ms]
+        if leaked:  # pragma: no cover - 逻辑上不可达，留作口径守卫
+            raise ValueError(f"内部错误：{thscode} 的 PIT 闸门自检失败。")
+
+        grouped = group_periods(rows)
+        period, facts, per_statement = select_common_period(grouped, as_of_ms)
+        if period is None:
+            return empty
+        current = {
+            "thscode": thscode, "period_key": per_statement[
+                next(iter(per_statement))]["period_key"], "period_end_ms": period,
+            "available_from_ms": max(item["available_from_ms"] for item in per_statement.values()),
+            "available_basis": next(iter(per_statement.values()))["available_basis"],
+            "disclosed_at_ms": None, "facts": facts,
+            "units": {}, "statements": sorted(per_statement)}
+        previous = select_prior_year_facts(
+            grouped, current["period_key"], as_of_ms, thscode=thscode)
+        statements = {statement: {**item, "facts": dict(item["facts"])}
+                      for statement, item in per_statement.items()}
         return {"thscode": thscode, "as_of_ms": as_of_ms, "current": current,
                 "previous": previous, "statements": statements}
 
-    def _financial_prior_rows(self, thscode: str, period_key: str, as_of_ms: int) -> list[tuple]:
-        db = duckdb.connect(str(self.path), read_only=True)
-        try:
-            return db.execute(
-                "SELECT statement, period_key, period_end_ms, field, value, unit, currency, "
-                "disclosed_at_ms, available_from_ms, available_basis FROM financial_facts "
-                "WHERE thscode=? AND period_key=? AND available_from_ms<=? "
-                "ORDER BY statement, field", [thscode, period_key, as_of_ms]).fetchall()
-        except duckdb.CatalogException:
-            return []
-        finally:
-            db.close()
+
 
     def financial_sync_ledger(self) -> list[dict]:
         if not self.path.exists():

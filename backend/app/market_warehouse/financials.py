@@ -181,6 +181,84 @@ def f_score_inputs(facts: dict[str, float]) -> dict[str, float | None]:
     return merged
 
 
+def group_periods(rows: list[dict]) -> dict[str, dict[int, dict]]:
+    """把 `financial_facts` 行按「报表 → 报告期末 → {闸门, 字段}」分组（纯函数，可单测）。"""
+    grouped: dict[str, dict[int, dict]] = {}
+    for row in rows:
+        slot = grouped.setdefault(row["statement"], {}).setdefault(
+            row["period_end_ms"],
+            {"available_from_ms": row["available_from_ms"],
+             "available_basis": row.get("available_basis"),
+             "period_key": row.get("period_key"), "facts": {}})
+        if row.get("value") is not None:
+            slot["facts"][row["field"]] = row["value"]
+    return grouped
+
+
+def select_common_period(grouped: dict[str, dict[int, dict]], as_of_ms: int
+                         ) -> tuple[int | None, dict[str, float], dict[str, dict]]:
+    """选「**各张报表都已披露**的最近报告期」，并返回该期的合并字段。
+
+    为什么必须"共同期"而不是"各表各自最新"：三表的披露节奏不同（资产负债表 Q4 的接口日期
+    实测比利润表晚 4 个月）。若按"全体最大期"取，会造出 **利润表 Q2 + 资产负债表 Q1** 这样的
+    组合，那么 `净利润 ÷ 资产总计` 的分子分母就**跨期**了——数字看着正常，却是错的。
+    这种错误在汇总层面完全看不出来，所以这里用"共同期"把它从结构上排除。
+
+    返回 `(period_end_ms, facts, per_statement)`；没有任何共同期时返回 `(None, {}, {})`。
+    """
+    eligible = {statement: {period: item for period, item in periods.items()
+                            if item["available_from_ms"] <= as_of_ms}
+                for statement, periods in grouped.items()}
+    eligible = {statement: periods for statement, periods in eligible.items() if periods}
+    if not eligible:
+        return None, {}, {}
+    common = set.intersection(*[set(periods) for periods in eligible.values()])
+    if not common:
+        return None, {}, {}
+    period = max(common)
+    facts: dict[str, float] = {}
+    per_statement: dict[str, dict] = {}
+    for statement, periods in eligible.items():
+        item = periods[period]
+        facts.update(item["facts"])
+        per_statement[statement] = item
+    return period, facts, per_statement
+
+
+def prior_year_key(period_key: str) -> str | None:
+    """`2026-Q2` → `2025-Q2`（Δ 类信号用同季同比：季报累计口径下才是同一口径的比较）。"""
+    year, separator, quarter = str(period_key).partition("-")
+    if not separator or not year.isdigit():
+        return None
+    return f"{int(year) - 1}-{quarter}"
+
+
+def select_prior_year_facts(grouped: dict[str, dict[int, dict]], current_key: str,
+                            as_of_ms: int, *, thscode: str = "") -> dict | None:
+    """取**上年同季**那一期的字段（同样受闸门约束）；取不到返回 `None`。
+
+    与 `select_common_period` 同一套口径：跨表取"该期各表都有"的字段，缺的就不给。
+    """
+    prior = prior_year_key(current_key)
+    if not prior:
+        return None
+    period: int | None = None
+    facts: dict[str, float] = {}
+    info: dict[str, dict] = {}
+    for statement, periods in grouped.items():
+        for end_ms, item in periods.items():
+            if item.get("period_key") != prior or item["available_from_ms"] > as_of_ms:
+                continue
+            period = end_ms if period is None else max(period, end_ms)
+            facts.update(item["facts"])
+            info[statement] = item
+    if period is None or not facts:
+        return None
+    return {"thscode": thscode, "period_key": prior, "period_end_ms": period,
+            "available_from_ms": max(item["available_from_ms"] for item in info.values()),
+            "available_basis": next(iter(info.values()))["available_basis"], "facts": facts}
+
+
 def f_score_local_coverage() -> dict:
     """如实说明：本地方案能覆盖 9 项里的哪几项、哪些恒为 N/A。"""
     total = 9
