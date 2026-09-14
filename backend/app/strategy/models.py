@@ -91,6 +91,15 @@ class RiskProfile(BaseModel):
     regime_filter: bool = False
     #: 状态序列的均线天数（等权全市场指数 > 它的 N 日均线才算"走强"）。
     regime_ma_days: int = Field(default=60, ge=10, le=250)
+    #: **波动率目标**（年化，小数）：目标总仓位 = 目标波动 / 市场已实现波动，封顶 1.0。
+    #: 这是机构最常用、也唯一**不需要预测方向**的仓位机制：波动大就少下注。
+    #: `None` = 不做仓位调节（对照基准）。
+    target_vol_pct: float | None = Field(default=None, ge=0.02, le=0.6)
+    #: 已实现波动的回看窗口（交易日）。
+    vol_lookback_days: int = Field(default=60, ge=20, le=250)
+    #: 仓位下限：极端行情下最多降到这个比例，**不允许降到 0**。
+    #: 理由有实测支撑——"全进全出"会把回撤期拉长（见 25 号文档）；连续减仓才是对的做法。
+    min_exposure: float = Field(default=0.10, gt=0, le=1.0)
 
     @model_validator(mode="after")
     def _coherent(self):

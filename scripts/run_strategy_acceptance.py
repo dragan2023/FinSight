@@ -33,15 +33,24 @@ from backend.app.strategy.acceptance import (  # noqa: E402
     evaluate_acceptance,
 )
 from backend.app.strategy.local_bars import local_price_bars  # noqa: E402
-from backend.app.strategy.regime import market_regime_series, regime_gate  # noqa: E402
+from backend.app.strategy.regime import (  # noqa: E402
+    market_index_returns,
+    market_regime_series,
+    realized_vol_series,
+    regime_gate,
+    vol_target_exposure,
+)
 from backend.app.strategy.registry import get_risk_profile  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 DEFAULT_STRATEGIES = ("trend_20_60_v1", "reversal_5d_v1")
-#: 默认四档：无风控（对照）/ 保守 / 保守+下跌市不交易（60 日）/ 同规则但 120 日慢线
-#: （慢线是用来判断"这条规则是不是靠短期择时碰运气"的对照）。
-DEFAULT_PROFILES = ("risk_none_v1", "risk_conservative_v1", "risk_regime_v1",
-                    "risk_regime_slow_v1")
+#: 默认四档：无风控（对照）/ 保守 / 波动率目标 15% / 波动率目标 10%。
+#: 两档波动目标必须一起跑：只知道"某一档好看"无法判断是不是系数碰巧，
+#: 单调性（目标越低 → 回撤越浅 → 收益越低）才是它真的在起作用的证据。
+#: 下跌市不交易那两档（risk_regime_v1 / risk_regime_slow_v1）2026-09-15 已实测未通过，
+#: 结论记在 25 号文档；需要复跑时用 --risk-profiles 显式指定。
+DEFAULT_PROFILES = ("risk_none_v1", "risk_conservative_v1", "risk_voltarget_v1",
+                    "risk_voltarget_low_v1")
 
 
 def build_universe(repository, *, top: int, as_of_ms: int) -> list[str]:
@@ -118,6 +127,34 @@ def main() -> int:
                            for days, gate in sorted(regime_gates.items()))
         print(f"市场状态（等权全市场指数）：{summary}")
 
+    # 波动率目标：波动率序列只算一次，不同档位只是在同一序列上取不同的目标值。
+    vol_by_lookback: dict[int, dict[str, float]] = {}
+    exposure_by_profile: dict[str, dict[str, float]] = {}
+    vol_profiles = [get_risk_profile(pid) for pid in profiles
+                    if get_risk_profile(pid).target_vol_pct is not None]
+    if vol_profiles:
+        market_returns = market_index_returns(repository, end_ms=as_of_ms)
+        for profile in vol_profiles:
+            if profile.vol_lookback_days not in vol_by_lookback:
+                vol_by_lookback[profile.vol_lookback_days] = realized_vol_series(
+                    market_returns, lookback_days=profile.vol_lookback_days)
+            exposure_by_profile[profile.id] = vol_target_exposure(
+                vol_by_lookback[profile.vol_lookback_days],
+                target_vol=profile.target_vol_pct, min_exposure=profile.min_exposure)
+        for lookback, vols in sorted(vol_by_lookback.items()):
+            values = sorted(vols.values())
+            middle = values[len(values) // 2] if values else 0.0
+            print(f"市场已实现波动（{lookback} 日年化）：中位 {middle:.1%}｜"
+                  f"最低 {values[0]:.1%}｜最高 {values[-1]:.1%}｜样本 {len(values)} 天")
+        for profile in vol_profiles:
+            series = exposure_by_profile[profile.id]
+            if not series:
+                continue
+            values = [series[key] for key in sorted(series)]
+            print(f"  仓位序列 {profile.id}：均值 {sum(values) / len(values):.1%}｜"
+                  f"最低 {min(values):.1%}｜满仓占 "
+                  f"{sum(1 for value in values if value >= 0.999999) / len(values):.0%} 的交易日")
+
     results: list[dict] = []
     for strategy in strategies:
         for profile_id in profiles:
@@ -128,7 +165,8 @@ def main() -> int:
                 max_industry_weight=args.max_industry_weight,
                 analysis_start_date=analysis_start, risk=profile,
                 regime=(regime_gates.get(profile.regime_ma_days)
-                        if profile.regime_filter else None))
+                        if profile.regime_filter else None),
+                vol_exposure=exposure_by_profile.get(profile_id))
             curve = outcome["portfolio"]["curve"]
             judgement = evaluate_acceptance(curve, thresholds=thresholds,
                                             risk_stats=outcome.get("risk_stats"),

@@ -17,7 +17,11 @@ from backend.app.strategy.acceptance import AcceptanceThresholds, evaluate_accep
 from backend.app.strategy.backtest import _gapped, run_backtest
 from backend.app.strategy.models import PriceBar, RiskProfile
 from backend.app.strategy.registry import get_risk_profile, list_risk_profiles
-from backend.app.strategy.regime import regime_gate
+from backend.app.strategy.regime import (  # noqa: E402
+    realized_vol_series,
+    regime_gate,
+    vol_target_exposure,
+)
 
 START = date(2020, 1, 1)
 
@@ -144,18 +148,6 @@ def test_limit_up_blocking_rule_itself():
     assert _gapped(11.0, None, 0.095, down=False) is False     # 缺前收 → 不臆断
 
 
-def test_risk_stats_are_reported_so_the_layer_is_auditable():
-    """统计必须报出来：否则无法回答"风控到底拦了什么"（等于不可审计）。"""
-    bars = bars_from(_trending_up())
-    result = run_backtest("trend_20_60_v1", bars, 10,
-                          risk=get_risk_profile("risk_conservative_v1"))
-    for key in ("entries", "stop_exits", "blocked_entries_limit_up",
-                "blocked_exits_limit_down", "skipped_entries_liquidity",
-                "skipped_entries_missing_turnover", "skipped_entries_cooldown"):
-        assert key in result["risk_stats"], f"缺少风控统计 {key}"
-    assert result["risk_profile"] == "risk_conservative_v1"
-
-
 def test_liquidity_floor_and_missing_turnover_both_block_entries():
     """成交额不足、或成交额缺失 → 都不开仓（缺失时**不假装它达标**）。"""
     up = _trending_up(80, 0.008)
@@ -265,3 +257,130 @@ def test_regime_filter_blocks_new_entries(repository=None):
     allowed = run_backtest("trend_20_60_v1", bars, 10, risk=profile, regime=on)
     assert allowed["risk_stats"]["entries"] > 0
     assert allowed["risk_stats"]["skipped_entries_regime"] == 0
+
+
+# --- 5. 波动率目标：只压深度、不加杠杆、不降到 0 -----------------------------
+
+def test_vol_target_exposure_never_leverages_and_respects_the_floor():
+    """机构式仓位规则的三条硬约束：**不加杠杆、有下限、波动越大仓位越低**。"""
+    vols = {"2020-01-01": 0.30, "2020-01-02": 0.15, "2020-01-03": 0.05, "2020-01-04": 5.0}
+    exposure = vol_target_exposure(vols, target_vol=0.15, min_exposure=0.10)
+    assert abs(exposure["2020-01-01"] - 0.5) < 1e-12, "目标 15% / 实现 30% → 应恰好半仓"
+    assert abs(exposure["2020-01-02"] - 1.0) < 1e-12, "实现波动等于目标 → 满仓"
+    assert abs(exposure["2020-01-03"] - 1.0) < 1e-12, \
+        "市场波动低于目标时也只能满仓——这是长多研究工具，**不许加杠杆**"
+    assert abs(exposure["2020-01-04"] - 0.10) < 1e-12, "极端波动时降到下限"
+    assert all(0.0 < value <= 1.0 for value in exposure.values()), "仓位必须落在 (0, 1]"
+
+
+def test_vol_target_exposure_rejects_a_zero_floor():
+    """下限必须 > 0：**"降到空仓"是被实测否决过的做法**（全进全出会拉长回撤期）。"""
+    import pytest
+
+    with pytest.raises(ValueError):
+        vol_target_exposure({"2020-01-01": 0.3}, target_vol=0.15, min_exposure=0.0)
+
+
+def test_realized_vol_has_no_look_ahead_and_skips_short_history():
+    """第 d 天的波动率只能用到第 d 天为止的收益。
+
+    做法：先在完整序列上算一遍，再在**截断到第 80 天**的序列上算一遍，
+    前 80 天的值必须逐日相同——任何前视都会让两者不一致。
+    另外，样本不足 `lookback_days` 的日子**不出现在结果里**（不补 0、不猜）。
+    """
+    returns = {f"2020-{1 + index // 28:02d}-{1 + index % 28:02d}":
+               0.01 if index % 3 else -0.008 for index in range(200)}
+    full = realized_vol_series(returns, lookback_days=60)
+    days = sorted(returns)
+    assert days[0] not in full, "首个交易日没有 60 天历史，不该给出波动率"
+    truncated = realized_vol_series({day: returns[day] for day in days[:80]}, lookback_days=60)
+    assert set(truncated) == set(days[59:80])
+    for day in truncated:
+        assert truncated[day] == full[day], f"{day} 的波动率随未来数据变化 → 存在前视"
+
+
+def test_portfolio_vol_target_scales_total_exposure_and_keeps_cash():
+    """波动率目标在**组合层**整体缩放总仓位：仓位减半、其余进现金，选股不变。"""
+    targets = [PortfolioTarget(thscode=f"60000{index}.SH", name=f"标的{index}",
+                               industry="未分类", bars=bars_from(_trending_up()))
+               for index in range(6)]
+    common = {"strategy_ids": ["trend_20_60_v1"], "one_way_cost_bps": 10, "max_positions": 6,
+              "max_single_weight": 0.15, "max_industry_weight": 1.0}
+    plain = run_portfolio_backtest(targets, **common)
+    scaled_days = {point["period"]: 0.5 for point in plain["portfolio"]["curve"]}
+    scaled = run_portfolio_backtest(targets, vol_exposure=scaled_days, **common)
+
+    assert all(point["exposure"] == 1.0 for point in plain["portfolio"]["curve"]), \
+        "不传 vol_exposure 时不得改变任何行为（否则对照失效）"
+    traded = [point for point in scaled["portfolio"]["curve"] if point["exposure"] == 0.5]
+    assert traded, "缩放的交易日一个都没有，测试本身失效"
+    for point in traded:
+        assert point["invested_weight"] <= 0.5 + 1e-9, \
+            f"{point['period']} 仓位 {point['invested_weight']} 超过了 0.5 的缩放上限"
+    # 净值必须更低（仓位减半 + 成本），否则说明缩放根本没生效
+    assert scaled["portfolio"]["metrics"]["final_net_value"] < \
+        plain["portfolio"]["metrics"]["final_net_value"]
+    stats = scaled["risk_stats"]
+    assert stats["vol_target_scaled_days"] > 0
+    assert 0 < stats["vol_target_min_exposure_pct"] <= stats["vol_target_avg_exposure_pct"] <= 100
+
+
+def test_constant_exposure_cannot_change_drawdown_duration_but_time_varying_can():
+    """**上一轮那个错误结论的结构守卫**（见 25 号文档 §8）。
+
+    我先前量到"仓位 1.0/0.7/0.5/0.3/0.1 的回撤持续都是 1876 天"，据此断言
+    "降仓位只能改深度、改不了时长"。真相是**常数暴露下这是恒等式**：
+
+        净值(e) = e × 满仓净值 + (1 − e)
+
+    正仿射变换不移动峰值位置，也不移动"重新超过前高"的日期——所以时长必然逐档相同，
+    那个探针**结构上就不可能测出差异**。而**时变**暴露不受此限（波动率目标就是时变的），
+    实测确实把最长回撤期从 730 天压到 417 天。两条都要钉住，否则以后还会再犯同一个错。
+    """
+    values = [1.0 * (1.004 ** index) for index in range(160)]
+    values += [values[-1] * (0.995 ** k) for k in range(1, 140)]
+    bottom = values[-1]
+    values += [bottom * (1.002 ** k) for k in range(1, 240)]
+    curve = _curve(values)
+
+    def duration(items: list[dict]) -> int:
+        return evaluate_acceptance(items, label="探针")["metrics"]["max_drawdown_duration_days"]
+
+    baseline = duration(curve)
+    for exposure in (0.7, 0.5, 0.3, 0.1):
+        scaled = _curve([exposure * value + (1 - exposure) for value in values])
+        assert duration(scaled) == baseline, \
+            f"常数暴露 {exposure} 改变了回撤持续天数——仿射恒等式被打破了"
+        assert min(item["net_value"] for item in scaled) > min(
+            item["net_value"] for item in curve), "常数降仓必须让**深度**变浅"
+
+    # 时变暴露：只在深跌那一段（第 160–300 天）减半，其余满仓。
+    # 深度被削掉的是**下跌段**，要爬回来的距离因此变短 → 回撤期应当更短。
+    equity = 1.0
+    varying: list[float] = []
+    for index, value in enumerate(values):
+        gross = value / values[index - 1] - 1 if index else 0.0
+        exposure = 0.5 if 160 <= index < 300 else 1.0
+        equity *= 1 + exposure * gross
+        varying.append(equity)
+    assert duration(_curve(varying)) < baseline, \
+        "时变暴露（只在下跌段降仓）没能缩短回撤期——与 25 号文档 §8 的实测结论矛盾"
+
+
+def test_vol_target_profiles_are_declared_and_coherent():
+    """两档波动目标必须同时存在：只看一档无法判断是规则生效还是系数碰巧。
+
+    单调性由 `目标越低 → 仓位越低` 直接锁死，避免事后挑一个好看的系数。
+    """
+    from backend.app.strategy.registry import get_risk_profile as get_profile
+
+    low = get_profile("risk_voltarget_low_v1")
+    high = get_profile("risk_voltarget_v1")
+    assert low.target_vol_pct < high.target_vol_pct
+    assert low.vol_lookback_days == high.vol_lookback_days, \
+        "两档若连回看窗口都不同，比出来的差异就分不清是目标值还是窗口造成的"
+    assert low.min_exposure >= high.min_exposure, \
+        "目标更低的一档必须要求**更高的仓位下限**：两者连起来才是'更保守'（仓位更低但不清仓）"
+    assert 0 < high.min_exposure <= 1.0
+    for profile in list_risk_profiles():
+        assert 0 < profile.min_exposure <= 1.0

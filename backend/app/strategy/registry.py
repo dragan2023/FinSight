@@ -41,6 +41,22 @@ _RISK_PROFILES = {
         stop_loss_pct=0.08, drawdown_breaker_pct=0.20, min_turnover=1.0e8,
         limit_move_pct=0.095, volatility_gate=True, reentry_cooldown_days=5,
         regime_filter=True, regime_ma_days=120),
+    # **波动率目标档**（机构最常用、且唯一不需要方向预测的仓位机制）：
+    # 目标年化波动 15%，按等权全市场指数过去 60 个交易日的已实现波动反推总仓位。
+    # 依据：2026-09-15 实测"降仓位只减深度、不减时长"（1876 天不变），
+    # 而用户的"最大回撤 ≤20%"正是**深度**约束——所以这一档瞄准的是回撤深度。
+    "risk_voltarget_v1": RiskProfile(
+        id="risk_voltarget_v1", name="保守档 + 波动率目标 15%（60 日已实现波动，仓位 ≥10%）",
+        stop_loss_pct=0.08, drawdown_breaker_pct=0.20, min_turnover=1.0e8,
+        limit_move_pct=0.095, volatility_gate=True, reentry_cooldown_days=5,
+        target_vol_pct=0.15, vol_lookback_days=60, min_exposure=0.10),
+    # 更保守的波动目标（10%）＋不许降到 20% 以下：用来确认"减仓幅度"是否单调起作用，
+    # 而不是某个特定系数碰巧好看（A.2：所有比较都要计入，所以对照必须事先定好）。
+    "risk_voltarget_low_v1": RiskProfile(
+        id="risk_voltarget_low_v1", name="保守档 + 波动率目标 10%（60 日，仓位 ≥20%）",
+        stop_loss_pct=0.08, drawdown_breaker_pct=0.20, min_turnover=1.0e8,
+        limit_move_pct=0.095, volatility_gate=True, reentry_cooldown_days=5,
+        target_vol_pct=0.10, vol_lookback_days=60, min_exposure=0.20),
 }
 
 

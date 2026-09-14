@@ -146,12 +146,17 @@ def run_portfolio_backtest(
     gate: dict | None = None,
     risk=None,
     regime: dict[str, bool] | None = None,
+    vol_exposure: dict[str, float] | None = None,
 ) -> dict:
     """按日滚动配置研究组合；无信号或触及上限后不强行买入。
 
     `risk` 是 `strategy.models.RiskProfile`：逐标的回放时就地生效（止损/熔断/流动性/涨跌停
     不可成交），因此组合层拿到的仓位已经是**风控后**的仓位。返回的 ``daily_candidates``
     是审计资料：可复核为什么某天买入、为什么留现金。
+
+    `vol_exposure` 是 ``{交易日: 总仓位上限}``（来自 `strategy.regime.vol_target_exposure`）：
+    把当日所有目标权重**整体乘**这个系数，其余留在现金。它只压**深度**、不改选股，
+    因此不会把"选股能力"和"仓位调节"两件事混在一起——两者必须能分开评价。
     """
     if not targets:
         raise ValueError("组合至少需要一个标的。")
@@ -182,7 +187,12 @@ def run_portfolio_backtest(
     peak = 1.0
     pause_left = 0
     risk_stats = dict(risk_totals)
-    risk_stats.update({"breaker_triggers": 0, "breaker_pause_days": 0})
+    risk_stats.update({"breaker_triggers": 0, "breaker_pause_days": 0,
+                       "vol_target_scaled_days": 0, "vol_target_avg_exposure_pct": 0.0,
+                       "vol_target_min_exposure_pct": 100.0})
+    exposure_sum = 0.0
+    exposure_days = 0
+    exposure_min = 1.0
 
     for index, day in enumerate(dates):
         if index:
@@ -216,10 +226,23 @@ def run_portfolio_backtest(
             kept = {code: value for code, value in holdings.items() if code in active.get(day, {})}
             target_weights = ({code: value / pre_trade_equity for code, value in kept.items()}
                               if pre_trade_equity else {})
+            exposure = 1.0
         else:
             target_weights = allocate_candidates(
                 candidates, max_positions=max_positions, max_single_weight=max_single_weight,
                 max_industry_weight=max_industry_weight)
+            # 波动率目标：整体缩放总仓位（封顶 1.0，不加杠杆）。熔断暂停期间不缩放——
+            # 那时已经在降风险，再叠一层会让两套规则的归因纠缠不清。
+            exposure = 1.0 if vol_exposure is None else float(vol_exposure.get(day, 1.0))
+            exposure = min(1.0, max(0.0, exposure))
+            if target_weights and exposure < 1.0:
+                target_weights = {code: weight * exposure for code, weight in target_weights.items()}
+            if vol_exposure is not None:
+                exposure_days += 1
+                exposure_sum += exposure
+                exposure_min = min(exposure_min, exposure)
+                if exposure < 0.999999:
+                    risk_stats["vol_target_scaled_days"] += 1
         target_values = {code: pre_trade_equity * weight for code, weight in target_weights.items()}
         turnover = sum(abs(target_values.get(code, 0.0) - holdings.get(code, 0.0))
                        for code in set(target_values) | set(holdings))
@@ -243,12 +266,20 @@ def run_portfolio_backtest(
         equity = cash + sum(holdings.values())
         invested_weight = sum(holdings.values()) / equity if equity else 0.0
         daily_candidates.append({"date": day, "candidates": candidates, "selected_weights": target_weights,
+                                 "exposure": round(exposure, 8),
                                  "cash_weight_at_open": round(cash / (pre_trade_equity - transaction_cost), 8)
                                  if pre_trade_equity > transaction_cost else 0.0})
         curve.append({"period": day, "net_value": round(equity, 10),
                       "invested_weight": round(invested_weight, 8), "candidate_count": len(candidates),
                       "selected_count": len(target_weights), "turnover_value": round(turnover, 10),
-                      "transaction_cost": round(transaction_cost, 10)})
+                      "transaction_cost": round(transaction_cost, 10),
+                      "exposure": round(exposure, 8)})
+
+    if exposure_days:
+        risk_stats["vol_target_avg_exposure_pct"] = round(exposure_sum / exposure_days * 100, 4)
+        risk_stats["vol_target_min_exposure_pct"] = round(exposure_min * 100, 4)
+    else:
+        risk_stats["vol_target_min_exposure_pct"] = 100.0
 
     equal_curve = _equal_weight_buy_hold(targets, dates, one_way_cost_bps=one_way_cost_bps)
     portfolio_metrics = _metrics(curve, trade_count=len(trades))
