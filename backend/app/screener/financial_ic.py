@@ -69,6 +69,57 @@ def factor_values(facts: dict[str, float], prior_facts: dict[str, float] | None
     return values
 
 
+def snapshot_values(grouped: dict[str, dict[int, dict]], date_ms: int
+                    ) -> dict[str, float | None] | None:
+    """单个标的在某日的 PIT 因子值：**共同期**（各表都已披露的最近期）+ **上年同季**。
+
+    取不到共同期时返回 `None`（而不是空字典）——调用方要能区分"这只标的当日没有可用财报"
+    与"算出来全是缺失"。
+    """
+    period_end, facts, per_statement = select_common_period(grouped, date_ms)
+    if period_end is None or not facts:
+        return None
+    key = per_statement[next(iter(per_statement))]["period_key"]
+    previous = select_prior_year_facts(grouped, key, date_ms)
+    return factor_values(facts, previous["facts"] if previous else None)
+
+
+class FinancialFactorProvider:
+    """把财务数据集包成事件研究的**外部字段取值器**：`provider(field, thscode, date_ms)`。
+
+    事件研究对每个评估日都要为池内全部标的取值，而同一 (标的, 日期) 会被多个字段与变体
+    重复问到——所以缓存的是**整只标的当日的因子值字典**（若按字段缓存，快照会被重算好几遍）。
+    """
+
+    def __init__(self, repository) -> None:
+        self._repository = repository
+        self._grouped: dict[str, dict] | None = None
+        self._cache: dict[tuple[str, int], dict[str, float | None] | None] = {}
+
+    def _facts_by_symbol(self) -> dict[str, dict]:
+        if self._grouped is None:
+            by_symbol: dict[str, list[dict]] = {}
+            for row in self._repository.financial_facts_all():
+                by_symbol.setdefault(row["thscode"], []).append(row)
+            self._grouped = {symbol: group_periods(rows)
+                             for symbol, rows in by_symbol.items()}
+        return self._grouped
+
+    def __call__(self, field: str, thscode: str, date_ms: int | None) -> float | None:
+        if date_ms is None:
+            return None
+        key = (thscode, date_ms)
+        if key not in self._cache:
+            grouped = self._facts_by_symbol().get(thscode)
+            self._cache[key] = snapshot_values(grouped, date_ms) if grouped else None
+        values = self._cache[key]
+        return None if not values else values.get(field)
+
+    @property
+    def cache_size(self) -> int:
+        return len(self._cache)
+
+
 class FinancialFactorStudy:
     """财务因子 IC 评价。**每个参数都显式**，因为它们都会影响结论。"""
 
@@ -89,22 +140,25 @@ class FinancialFactorStudy:
         return self._grouped
 
     def snapshots(self, date_ms: int, symbols: set[str] | None = None) -> dict[str, dict]:
-        """当日每个标的的 PIT 快照与因子值（共同期 + 上年同季）。"""
+        """当日每个标的的 PIT 快照与因子值（共同期 + 上年同季）。
+
+        取值一律走 `snapshot_values`（与事件研究用的 provider 共用同一条路径）——
+        "共同期 + 上年同季 + 缺值不填补"只写一处，避免 IC 评价与事件研究两条口径漂移。
+        """
         grouped = self._facts_by_symbol()
         out: dict[str, dict] = {}
         for symbol, periods in grouped.items():
             if symbols is not None and symbol not in symbols:
                 continue
-            period_end, facts, per_statement = select_common_period(periods, date_ms)
-            if period_end is None or not facts:
+            values = snapshot_values(periods, date_ms)
+            if values is None:
                 continue
-            previous = select_prior_year_facts(periods, per_statement[
-                next(iter(per_statement))]["period_key"], date_ms, thscode=symbol)
+            period_end, _, per_statement = select_common_period(periods, date_ms)
             out[symbol] = {
                 "period_key": per_statement[next(iter(per_statement))]["period_key"],
                 "period_end_ms": period_end,
                 "available_basis": next(iter(per_statement.values()))["available_basis"],
-                "values": factor_values(facts, previous["facts"] if previous else None),
+                "values": values,
             }
         return out
 

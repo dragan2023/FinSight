@@ -21,6 +21,7 @@ from backend.app.screener.events import (
     ALL_FIELDS,
     FIELD_ENCODINGS,
     FIELD_FAMILIES,
+    KNOWN_FIELDS,
     LimitUpEventStudy,
     _t_stat,
     parse_family_prior_statistics,
@@ -508,7 +509,9 @@ def test_every_field_declares_a_family():
     这条是"防再犯"的守卫：`--field all` 曾经用一个全局计数把封成比的门槛算松
     （显示 3.023，而按族应为 3.227）。
     """
-    assert set(FIELD_FAMILIES) == set(ALL_FIELDS)
+    assert set(FIELD_FAMILIES) == set(KNOWN_FIELDS), \
+        "每个**已知**字段（含外部字段）都必须声明所属统计族，否则族级计数没有依据"
+    assert set(ALL_FIELDS) <= set(FIELD_FAMILIES)
     assert FIELD_FAMILIES["seal_money"] == FIELD_FAMILIES["seal_ratio"]
     assert FIELD_FAMILIES["continue_day_cnt"] != FIELD_FAMILIES["seal_ratio"]
 

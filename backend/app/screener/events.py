@@ -91,8 +91,40 @@ DERIVED_FIELDS = {
     },
 }
 
-#: 评估侧统一用这张表（池子原生字段 + 派生字段）。
+#: 评估侧统一用这张表（池子原生字段 + 派生字段）。**`--field all` 用的就是它**。
 ALL_FIELDS = {**FIELD_ENCODINGS, **DERIVED_FIELDS}
+
+#: **外部字段**：取值不来自涨停池，而是按 point-in-time 从**别的数据集**取（本轮是财务的
+#: F-Score）。它们刻意**不进入 `ALL_FIELDS`**：`--field all` 会把 `ALL_FIELDS` 全跑一遍，
+#: 而没有注入 provider 时外部字段只会产出"没有可用评估日"的空报告，白白污染既有产物。
+#: 要评价必须**显式指定** `fields=("f_score",)` 并注入 provider。
+#:
+#: 机制上仍是"字段"而不是另写一套估计量：分组、对照匹配、分层、重抽、多重检验计数
+#: 全部复用事件研究的同一条代码路径（`13`/`17` 号文档反复强调：估计量只能有一份）。
+EXTERNAL_FIELDS = {
+    "f_score": {
+        "name": "Piotroski F-Score（本地口径，来自财务数据集）",
+        "groups": ("F-Score 高(>当日池内中位数)", "F-Score 低(≤中位数)"),
+        "split": "按**当日池内中位数**分组（相对口径，不是绝对分值）",
+        "rule": lambda value, median: (None if not isinstance(value, (int, float))
+                                       or median is None else value > median),
+        "note": "外部字段：由 `screener.financial_ic.FinancialFactorProvider` 按**事件当日**"
+                "做 point-in-time 取值（只用 `available_from_ms <= 事件日` 的报告期，"
+                "且各表取共同期；缺值不给组，不填补）。",
+    },
+    "f_score_ratio": {
+        "name": "F-Score 归一化（得分 ÷ 可算项数，外部财务数据）",
+        "groups": ("归一化 F-Score 高(>当日池内中位数)", "归一化 F-Score 低(≤中位数)"),
+        "split": "按**当日池内中位数**分组",
+        "rule": lambda value, median: (None if not isinstance(value, (int, float))
+                                       or median is None else value > median),
+        "note": "与 `f_score` **同源**（同一批判定），只为处理『可算项数随行业变化』"
+                "（银行没有营业成本 → 可算 6 项）带来的不可比；不是独立证据。",
+    },
+}
+
+#: 校验与查表用的全集：池内字段 + 派生字段 + 外部字段。
+KNOWN_FIELDS = {**ALL_FIELDS, **EXTERNAL_FIELDS}
 
 #: 字段所属的**统计族**。族级多重检验计数**按族**累加（方案 A.2）——
 #: `seal_money` 与 `seal_ratio` 是同一底层数据的两种口径（高度相关，`17` §5 已写明
@@ -105,6 +137,10 @@ FIELD_FAMILIES = {
     "continue_day_cnt": "limit_up_continue_board",
     "seal_money": "limit_up_seal_strength",
     "seal_ratio": "limit_up_seal_strength",
+    # 交互族：**这是新族**（先验 0）。但报告会**同时**给出"把两个母族已看过的比较也计入"的
+    # 保守门槛（连板族 43 + 现金族 36 = 79 → 族级共 79+48），结论以更严的那个为准。
+    "f_score": "limit_up_financial_interaction",
+    "f_score_ratio": "limit_up_financial_interaction",
 }
 
 
@@ -127,8 +163,8 @@ def parse_family_prior_statistics(text: str) -> int | dict[str, int]:
         field = field.strip()
         if not separator or not field or not value.strip():
             raise ValueError(f"族级先验计数格式错误：{chunk!r}（应为『字段=条数』）")
-        if field not in ALL_FIELDS:
-            raise ValueError(f"族级先验计数出现未知字段：{field!r}（可选 {sorted(ALL_FIELDS)}）")
+        if field not in KNOWN_FIELDS:
+            raise ValueError(f"族级先验计数出现未知字段：{field!r}（可选 {sorted(KNOWN_FIELDS)}）")
         mapping[field] = int(value)
     if not mapping:
         raise ValueError(f"族级先验计数为空：{text!r}")
@@ -151,9 +187,9 @@ def resolve_family_priors(family_prior_statistics: int | Mapping[str, int],
     """
     if isinstance(family_prior_statistics, Mapping):
         mapping = family_prior_statistics
-        unknown = sorted(set(mapping) - set(ALL_FIELDS))
+        unknown = sorted(set(mapping) - set(KNOWN_FIELDS))
         if unknown:
-            raise ValueError(f"族级先验计数出现未知字段：{unknown}（可选 {sorted(ALL_FIELDS)}）")
+            raise ValueError(f"族级先验计数出现未知字段：{unknown}（可选 {sorted(KNOWN_FIELDS)}）")
         missing = sorted(set(fields) - set(mapping))
         if missing:
             raise ValueError(
@@ -318,8 +354,14 @@ def _day(date_ms: int) -> str:
 class LimitUpEventStudy:
     """事件研究。**每个参数都显式**，因为它们都会影响结论。"""
 
-    def __init__(self, repository) -> None:
+    def __init__(self, repository, *, external=None) -> None:
+        """`external` 是**外部字段的取值器**：`external(field, thscode, date_ms) -> float | None`。
+
+        只有评价 `EXTERNAL_FIELDS` 里的字段时才需要它（本轮是财务 F-Score 与涨停池的交互）。
+        不注入时这些字段一律取不到值 → 相关评估日自然被跳过，不会产出"看起来有结果"的空报告。
+        """
         self._repository = repository
+        self._external = external
 
     # --- 取数与对齐 -------------------------------------------------------
     def event_dates(self, *, start_ms: int | None = None, end_ms: int | None = None) -> list[int]:
@@ -370,6 +412,12 @@ class LimitUpEventStudy:
                     ("first_board", lambda item, med: item.get("continue_day_cnt") == 1),
                     ("multi_board",
                      lambda item, med: (item.get("continue_day_cnt") or 0) >= 2))
+        if field in EXTERNAL_FIELDS:
+            # 同问：财务质量的"调节作用"会不会只是连板结构的影子？
+            return (("all", lambda item, med: True),
+                    ("first_board", lambda item, med: item.get("continue_day_cnt") == 1),
+                    ("multi_board",
+                     lambda item, med: (item.get("continue_day_cnt") or 0) >= 2))
         # 连板高度的"无区分度"是否被封单结构掩盖？在封单高/低内部各自再比一次。
         return (("all", lambda item, med: True),
                 ("high_seal",
@@ -379,11 +427,13 @@ class LimitUpEventStudy:
 
     @staticmethod
     def _field_values(field: str, pool: dict[str, dict],
-                      cross_by_symbol: dict[str, dict]) -> dict[str, float]:
-        """当日**池内**该字段的取值（派生字段在这里算）。
+                      cross_by_symbol: dict[str, dict],
+                      external=None) -> dict[str, float]:
+        """当日**池内**该字段的取值（派生字段与外部字段都在这里算）。
 
         派生字段缺当日横截面行或分母 ≤ 0 时**不给值**——绝不能拿 0 或全网均值去凑，
         否则"缺数据"会被当成"低封成比"混进低组，直接把结论做出来。
+        外部字段同理：provider 取不到就给不出值（不填补、不用池内均值顶替）。
         """
         if field in DERIVED_FIELDS:
             build = DERIVED_FIELDS[field]["build"]
@@ -393,6 +443,15 @@ class LimitUpEventStudy:
                 if row is None:
                     continue
                 value = build(item, row)
+                if value is not None:
+                    values[symbol] = value
+            return values
+        if field in EXTERNAL_FIELDS:
+            if external is None:
+                return {}
+            values = {}
+            for symbol, item in pool.items():
+                value = external(field, symbol, item.get("date_ms"))
                 if value is not None:
                     values[symbol] = value
             return values
@@ -485,13 +544,13 @@ class LimitUpEventStudy:
         details: dict[str, dict] = {}
         # 分层要用到**另一个字段**的中位数（例如"封单高"这一层）。原生字段与派生字段
         # 都按同一套 `_field_values` 取（派生字段要读当日横截面行），绝不两处各写一遍。
-        field_values = {name: self._field_values(name, pool, snapshot)
-                        for name in ALL_FIELDS}
+        field_values = {name: self._field_values(name, pool, snapshot, self._external)
+                        for name in KNOWN_FIELDS}
         medians = {name: (sorted(values.values())[len(values) // 2] if values else None)
                    for name, values in field_values.items()}
 
         for field in fields:
-            encoding = ALL_FIELDS[field]
+            encoding = KNOWN_FIELDS[field]
             values = field_values[field]
             median = medians[field]
 
@@ -630,7 +689,7 @@ class LimitUpEventStudy:
                         variant: str, draws: int) -> dict:
         entries = [per_date[date_ms]["variants"][variant] for date_ms in usable]
         results = {}
-        for side, label in zip(("high", "low"), ALL_FIELDS[field]["groups"]):
+        for side, label in zip(("high", "low"), KNOWN_FIELDS[field]["groups"]):
             series = [entry[f"{side}_excess"] for entry in entries]
             results[side] = {
                 "group": label, "events": sum(entry[f"{side}_events"] for entry in entries),
@@ -717,8 +776,9 @@ class LimitUpEventStudy:
         all_threshold = round(_z_for_two_sided(0.05 / statistics_tested), 3)
         family_threshold = round(_z_for_two_sided(0.05 / family_total), 3)
         return {
-            "field": field, "field_name": ALL_FIELDS[field]["name"],
-            "groups": ALL_FIELDS[field]["groups"], "split": ALL_FIELDS[field]["split"],
+            "field": field, "field_name": KNOWN_FIELDS[field]["name"],
+            "groups": KNOWN_FIELDS[field]["groups"],
+            "split": KNOWN_FIELDS[field]["split"],
             # 数据通路必须随结果一起披露：面板与 live 已做过逐位等价比对（49,095 个单元
             # 零差异），但读者仍需知道这份数字是从哪条通路来的。
             "data_path": source_info or {"source": "live"},
@@ -883,9 +943,9 @@ class LimitUpEventStudy:
         - `"live"`：逐日调用 `cross_section` + `settlement_returns`。慢得多（每个评估日
           两次全表扫描），保留它是为了**与面板做等价比对**——两条通路共用 `_details`。
         """
-        unknown = [item for item in fields if item not in ALL_FIELDS]
+        unknown = [item for item in fields if item not in KNOWN_FIELDS]
         if unknown:
-            raise ValueError(f"不支持的事件研究字段：{unknown}（可选 {list(ALL_FIELDS)}）")
+            raise ValueError(f"不支持的事件研究字段：{unknown}（可选 {list(KNOWN_FIELDS)}）")
         if not fields:
             raise ValueError("至少要指定一个字段。")
         if draws < 1 or not 1 <= horizon_days <= 250:
