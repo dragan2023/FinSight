@@ -17,6 +17,7 @@ from backend.app.strategy.acceptance import AcceptanceThresholds, evaluate_accep
 from backend.app.strategy.backtest import _gapped, run_backtest
 from backend.app.strategy.models import PriceBar, RiskProfile
 from backend.app.strategy.registry import get_risk_profile, list_risk_profiles
+from backend.app.strategy.regime import regime_gate
 
 START = date(2020, 1, 1)
 
@@ -213,9 +214,54 @@ def test_acceptance_refuses_to_judge_tiny_samples():
 
 
 def test_threshold_defaults_are_the_ones_the_user_confirmed():
-    """验收阈值是用户 2026-09-15 确认的，不能悄悄改。"""
+    """验收阈值是用户确认的，不能悄悄改。
+
+    回撤持续这一条：2026-09-15 首轮跑完（实测 586–792 天，阈值 365 天不过）之后，
+    用户**主动把它收紧到 183 天（半年）**——收紧方向合规；若是看到不过就放宽，
+    那才是"调参以通过"。
+    """
     thresholds = AcceptanceThresholds()
     assert thresholds.max_drawdown_pct == 20.0
     assert thresholds.max_worst_year_loss_pct == 10.0
-    assert thresholds.max_drawdown_duration_days == 365
+    assert thresholds.max_drawdown_duration_days == 183
     assert thresholds.require_positive_expectancy is True
+
+
+def test_regime_gate_is_not_look_ahead_and_blocks_before_warmup():
+    """市场状态序列：均线成形前一律不可开仓；`risk_on` 只看当日及以前的指数。
+
+    构造一个"先跌后涨"的人工指数序列：在均线还没成形时必须为 False；
+    指数上穿均线之后才允许开仓。
+    """
+    series = {}
+    index = 1.0
+    for day in range(1, 41):
+        index *= 1.0 - 0.01 if day <= 20 else 1.03      # 先跌 20 天，再涨 20 天
+        # `ma` 刻意等于 `index` → `risk_on` 必须是 False（判据是**严格大于**）
+        series[f"2020-01-{day:02d}"] = {"index": index, "ma": index, "risk_on": False,
+                                        "samples": day}
+    gate = regime_gate(series, warmup_days=10)
+    assert gate["2020-01-05"] is False, "均线样本不足时必须拒绝开仓（宁可晚入场）"
+    assert gate["2020-01-15"] is False, "index 不大于 ma 时必须拒绝"
+
+    series["2020-02-01"] = {"index": 1.2, "ma": 1.0, "risk_on": True, "samples": 60}
+    assert regime_gate(series, warmup_days=10)["2020-02-01"] is True, "上穿均线后应允许开仓"
+    # 样本不足时即使 risk_on 为真也必须拒绝（预热期不得假装"大盘没问题"）
+    series["2020-02-02"] = {"index": 1.3, "ma": 1.0, "risk_on": True, "samples": 3}
+    assert regime_gate(series, warmup_days=10)["2020-02-02"] is False
+
+
+def test_regime_filter_blocks_new_entries(repository=None):
+    """风控档位里 `regime_filter=True` 时，状态为"关"的日子不得开新仓。"""
+    bars = bars_from(_trending_up())
+    profile = RiskProfile(id="risk_test_regime_v1", name="测试用状态档",
+                          regime_filter=True, volatility_gate=False)
+    off = {bar.date: False for bar in bars}
+    result = run_backtest("trend_20_60_v1", bars, 10, risk=profile, regime=off)
+    assert result["risk_stats"]["entries"] == 0
+    assert result["risk_stats"]["skipped_entries_regime"] > 0
+
+    on = {bar.date: True for bar in bars}
+    allowed = run_backtest("trend_20_60_v1", bars, 10, risk=profile, regime=on)
+    assert allowed["risk_stats"]["entries"] > 0
+    assert allowed["risk_stats"]["skipped_entries_regime"] == 0

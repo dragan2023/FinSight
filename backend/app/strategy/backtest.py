@@ -53,7 +53,8 @@ def current_signal_snapshot(strategy_id: str, bars: list[PriceBar], *, gate: dic
             "basis": "latest_completed_forward_adjusted_daily_bar"}
 
 def run_backtest(strategy_id: str, bars: list[PriceBar], cost_bps: int, *,
-                 gate: dict | None = None, risk: RiskProfile | None = None) -> dict:
+                 gate: dict | None = None, risk: RiskProfile | None = None,
+                 regime: dict[str, bool] | None = None) -> dict:
     """单标的、无前视的回放；`risk` 挂风控档位（`None` = 与历史行为**逐位一致**）。
 
     执行模型（自 `11` 号文档 F23 起就固定）：**信号在 i−1 收盘后形成，最早只能在 i 的开盘成交**，
@@ -83,7 +84,7 @@ def run_backtest(strategy_id: str, bars: list[PriceBar], cost_bps: int, *,
     cooldown = 0
     stats = {"stop_exits": 0, "blocked_entries_limit_up": 0, "blocked_exits_limit_down": 0,
              "skipped_entries_liquidity": 0, "skipped_entries_missing_turnover": 0,
-             "skipped_entries_cooldown": 0, "entries": 0}
+             "skipped_entries_cooldown": 0, "skipped_entries_regime": 0, "entries": 0}
     limit = risk.limit_move_pct if risk is not None else None
     stop_pct = risk.stop_loss_pct if risk is not None else None
     min_turnover = risk.min_turnover if risk is not None else None
@@ -125,7 +126,11 @@ def run_backtest(strategy_id: str, bars: list[PriceBar], cost_bps: int, *,
                 position = 0; held = 0
         elif execute and desired != position and desired:
             blocked = False
-            if limit is not None and _gapped(bar.open, prev_close, limit, down=False):
+            # 下跌市不交易：状态为"关"时不开新仓（已持仓不动）。状态序列由调用方按
+            # 全市场数据算好（`strategy.regime`），且**只用当日及以前**的信息。
+            if regime is not None and not regime.get(bar.date, False):
+                blocked = True; stats["skipped_entries_regime"] += 1
+            if not blocked and limit is not None and _gapped(bar.open, prev_close, limit, down=False):
                 blocked = True; stats["blocked_entries_limit_up"] += 1
             if not blocked and cooldown > 0:
                 blocked = True; stats["skipped_entries_cooldown"] += 1

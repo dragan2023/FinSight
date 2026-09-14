@@ -85,6 +85,12 @@ class RiskProfile(BaseModel):
     #: 止损后**同一标的**的再入场冷静期（交易日）。0 = 允许次日立刻重进。
     #: 存在理由：止损当天信号往往还没转向，没有冷静期就会被同样的条件反复进出（来回挨打）。
     reentry_cooldown_days: int = Field(default=0, ge=0, le=60)
+    #: **下跌市不交易**：把市场状态序列（`strategy.regime`）接进来，状态为"关"时不新开仓。
+    #: 这是针对唯一卡住的那条验收（回撤最长持续）最常规的应对：长多策略的回撤期之所以长，
+    #: 是因为它在下跌市里照样满仓挨打。**已持仓不动**（只拦开新仓）。
+    regime_filter: bool = False
+    #: 状态序列的均线天数（等权全市场指数 > 它的 N 日均线才算"走强"）。
+    regime_ma_days: int = Field(default=60, ge=10, le=250)
 
     @model_validator(mode="after")
     def _coherent(self):

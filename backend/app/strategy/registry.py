@@ -27,6 +27,20 @@ _RISK_PROFILES = {
         id="risk_loose_v1", name="宽档（止损 15% + 回撤熔断 30%）",
         stop_loss_pct=0.15, drawdown_breaker_pct=0.30, min_turnover=1.0e8,
         limit_move_pct=0.095, volatility_gate=True),
+    # **下跌市不交易档**（用户把回撤期阈值从 365 收紧到 183 天后新增）：
+    # 在保守档之上加"等权全市场指数 > 60 日均线才开新仓"。理由：长多策略回撤期长的
+    # 根因是在下跌市里照样满仓挨打；这是最常规、也最可解释的应对，不需要新的预测能力。
+    "risk_regime_v1": RiskProfile(
+        id="risk_regime_v1", name="保守档 + 下跌市不交易（指数 > 60 日均线才开仓）",
+        stop_loss_pct=0.08, drawdown_breaker_pct=0.20, min_turnover=1.0e8,
+        limit_move_pct=0.095, volatility_gate=True, reentry_cooldown_days=5,
+        regime_filter=True, regime_ma_days=60),
+    # 更慢的状态线（120 日）：用来判断"规则是不是靠短期择时碰运气"。
+    "risk_regime_slow_v1": RiskProfile(
+        id="risk_regime_slow_v1", name="保守档 + 下跌市不交易（指数 > 120 日均线）",
+        stop_loss_pct=0.08, drawdown_breaker_pct=0.20, min_turnover=1.0e8,
+        limit_move_pct=0.095, volatility_gate=True, reentry_cooldown_days=5,
+        regime_filter=True, regime_ma_days=120),
 }
 
 

@@ -66,7 +66,7 @@ def _bars_by_date(target: PortfolioTarget) -> dict[str, PriceBar]:
 
 def _active_strategy_map(
     targets: list[PortfolioTarget], strategy_ids: list[str], *, one_way_cost_bps: int,
-    gate: dict | None, risk=None,
+    gate: dict | None, risk=None, regime: dict[str, bool] | None = None,
 ) -> tuple[dict[str, dict[str, set[str]]], dict]:
     """返回 ``(交易日 -> 标的 -> 当前已执行策略, 风控统计合计)``，不读取未来数据。"""
     daily: dict[str, dict[str, set[str]]] = {}
@@ -74,7 +74,7 @@ def _active_strategy_map(
     for target in targets:
         for strategy_id in strategy_ids:
             result = run_backtest(strategy_id, target.bars, one_way_cost_bps, gate=gate,
-                                  risk=risk)
+                                  risk=risk, regime=regime)
             for key, value in (result.get("risk_stats") or {}).items():
                 totals[key] = totals.get(key, 0) + int(value)
             for point in result["curve"]:
@@ -145,6 +145,7 @@ def run_portfolio_backtest(
     analysis_start_date: str | None = None,
     gate: dict | None = None,
     risk=None,
+    regime: dict[str, bool] | None = None,
 ) -> dict:
     """按日滚动配置研究组合；无信号或触及上限后不强行买入。
 
@@ -166,7 +167,7 @@ def run_portfolio_backtest(
     price_maps = {item.thscode: _bars_by_date(item) for item in targets}
     active, risk_totals = _active_strategy_map(targets, strategy_ids,
                                                one_way_cost_bps=one_way_cost_bps,
-                                               gate=gate, risk=risk)
+                                               gate=gate, risk=risk, regime=regime)
     cost_rate = one_way_cost_bps / 10_000
     cash = 1.0
     holdings: dict[str, float] = {}

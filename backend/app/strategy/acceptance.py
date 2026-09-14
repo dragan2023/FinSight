@@ -6,7 +6,7 @@
 |---|---|---|
 | 最大回撤 | ≤ **20%** | 从最高点最多跌两成 |
 | 单年最差 | ≥ **−10%** | 任何自然年不亏超过一成 |
-| 回撤最长持续 | ≤ **12 个月** | 从最高点回到前高不超过一年 |
+| 回撤最长持续 | ≤ **183 天（6 个月）** | 从最高点回到前高不超过半年。**用户看过首轮结果后主动收紧**（原 365 天）——收紧方向合规；若是看到不过就放宽，那就是"调参以通过" |
 | 期望 | **> 0**（扣双边成本后） | 赚钱，这是底线 |
 
 另外两条**防自欺**的检查（阈值不是用户给的，是我加的，理由写在各条里）：
@@ -32,7 +32,9 @@ class AcceptanceThresholds(BaseModel):
     model_config = ConfigDict(extra="forbid")
     max_drawdown_pct: float = Field(default=20.0, gt=0, le=90)
     max_worst_year_loss_pct: float = Field(default=10.0, gt=0, le=90)
-    max_drawdown_duration_days: int = Field(default=365, ge=20, le=3650)
+    #: 回撤最长持续：用户 2026-09-15 看过首轮结果后主动把 365 天收紧到 **183 天（半年）**。
+    #: 收紧是合规的（放宽才是"调参以通过"）；但要意识到它比 A 股长多策略的典型恢复期更严。
+    max_drawdown_duration_days: int = Field(default=183, ge=20, le=3650)
     require_positive_expectancy: bool = True
     require_survives_best_day_removal: bool = True
     out_of_sample_share: float = Field(default=0.2, gt=0, lt=0.5)

@@ -33,11 +33,15 @@ from backend.app.strategy.acceptance import (  # noqa: E402
     evaluate_acceptance,
 )
 from backend.app.strategy.local_bars import local_price_bars  # noqa: E402
+from backend.app.strategy.regime import market_regime_series, regime_gate  # noqa: E402
 from backend.app.strategy.registry import get_risk_profile  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 DEFAULT_STRATEGIES = ("trend_20_60_v1", "reversal_5d_v1")
-DEFAULT_PROFILES = ("risk_none_v1", "risk_conservative_v1", "risk_loose_v1")
+#: 默认四档：无风控（对照）/ 保守 / 保守+下跌市不交易（60 日）/ 同规则但 120 日慢线
+#: （慢线是用来判断"这条规则是不是靠短期择时碰运气"的对照）。
+DEFAULT_PROFILES = ("risk_none_v1", "risk_conservative_v1", "risk_regime_v1",
+                    "risk_regime_slow_v1")
 
 
 def build_universe(repository, *, top: int, as_of_ms: int) -> list[str]:
@@ -100,6 +104,20 @@ def main() -> int:
     print(f"有效标的 {len(targets)} 只｜评价起点 {analysis_start}（预热 {args.warmup_bars} 根）")
 
     thresholds = AcceptanceThresholds()
+    # 市场状态序列（下跌市不交易）只在需要时才算：实测 0.7 秒一条，代价可忽略。
+    regime_gates: dict[int, dict[str, bool]] = {}
+    for profile_id in profiles:
+        profile = get_risk_profile(profile_id)
+        if profile.regime_filter and profile.regime_ma_days not in regime_gates:
+            series = market_regime_series(repository, end_ms=as_of_ms,
+                                          ma_days=profile.regime_ma_days)
+            regime_gates[profile.regime_ma_days] = regime_gate(series)
+    if regime_gates:
+        summary = "、".join(f"{days} 日均线（走强占 "
+                           f"{sum(1 for value in gate.values() if value) / max(1, len(gate)):.0%} 的交易日）"
+                           for days, gate in sorted(regime_gates.items()))
+        print(f"市场状态（等权全市场指数）：{summary}")
+
     results: list[dict] = []
     for strategy in strategies:
         for profile_id in profiles:
@@ -108,7 +126,9 @@ def main() -> int:
                 targets, strategy_ids=[strategy], one_way_cost_bps=args.cost_bps,
                 max_positions=args.max_positions, max_single_weight=args.max_single_weight,
                 max_industry_weight=args.max_industry_weight,
-                analysis_start_date=analysis_start, risk=profile)
+                analysis_start_date=analysis_start, risk=profile,
+                regime=(regime_gates.get(profile.regime_ma_days)
+                        if profile.regime_filter else None))
             curve = outcome["portfolio"]["curve"]
             judgement = evaluate_acceptance(curve, thresholds=thresholds,
                                             risk_stats=outcome.get("risk_stats"),
