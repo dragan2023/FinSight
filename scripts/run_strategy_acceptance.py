@@ -28,6 +28,16 @@ sys.path.insert(0, str(ROOT))
 from backend.app.market_warehouse.repository import WarehouseRepository  # noqa: E402
 from backend.app.portfolio.backtest import PortfolioTarget, run_portfolio_backtest  # noqa: E402
 from backend.app.portfolio.construction import ConstructionPolicy  # noqa: E402
+from backend.app.portfolio.schedule import (  # noqa: E402
+    every_nth_decision_days,
+    monthly_decision_days,
+)
+from backend.app.portfolio.universe import (  # noqa: E402
+    describe as describe_universe,
+    eligibility_series,
+    liquidity_universe,
+    union_symbols,
+)
 from backend.app.settings import load_settings  # noqa: E402
 from backend.app.strategy.acceptance import (  # noqa: E402
     AcceptanceThresholds,
@@ -44,6 +54,11 @@ from backend.app.strategy.regime import (  # noqa: E402
 from backend.app.strategy.registry import get_risk_profile  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
+
+
+def day_from_ms(value: int) -> str:
+    """毫秒时间戳 → 北京时间 `YYYY-MM-DD`（与 `strategy/regime.py` 同一口径）。"""
+    return datetime.fromtimestamp(value / 1000, CST).strftime("%Y-%m-%d")
 DEFAULT_STRATEGIES = ("trend_20_60_v1", "reversal_5d_v1")
 #: 默认四档：无风控（对照）/ 保守 / 波动率目标 15% / 波动率目标 10%。
 #: 两档波动目标必须一起跑：只知道"某一档好看"无法判断是不是系数碰巧，
@@ -89,6 +104,14 @@ def main() -> int:
     parser.add_argument("--risk-lookback-days", type=int, default=120)
     parser.add_argument("--shrinkage", type=float, default=0.5)
     parser.add_argument("--warmup-bars", type=int, default=252, help="预热 K 线不计入成绩")
+    #: **决策节奏**（散户打法的核心）：`daily` = 每天都能加仓/换股（历史行为）；
+    #: `monthly` = 只有每月最后一个交易日能加仓/换股，中间只减不增；
+    #: `every:N` = 每 N 个交易日一次。
+    parser.add_argument("--cadence", default="monthly")
+    #: **时点股票池**：每个决策日按当日（含当日）的 20 日成交额重排前 N，
+    #: 而不是用"截至今天"的排名去跑十年前。`--static-universe` 可关掉（做对照）。
+    parser.add_argument("--static-universe", action="store_true",
+                        help="关掉时点股票池，回到固定池（历史行为，用作对照）")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
@@ -98,7 +121,6 @@ def main() -> int:
     if as_of_ms is None:
         print("行情库为空。")
         return 1
-    symbols = build_universe(repository, top=args.symbols, as_of_ms=as_of_ms)
     strategies = [item.strip() for item in args.strategies.split(",") if item.strip()]
     profiles = [item.strip() for item in args.risk_profiles.split(",") if item.strip()]
     constructions = [item.strip() for item in args.constructions.split(",") if item.strip()]
@@ -120,30 +142,81 @@ def main() -> int:
             max_total_exposure=args.max_total_exposure)
 
     started = time.time()
-    print(f"目标股票池：流动性前 {args.symbols} 只（截至 "
-          f"{datetime.fromtimestamp(as_of_ms / 1000, CST):%Y-%m-%d}）"
-          f"｜成本 {args.cost_bps}bps/边｜{len(strategies)} 策略 × {len(profiles)} 风控档位 × "
-          f"{len(constructions)} 组合构建方案")
+    print(f"成本 {args.cost_bps}bps/边｜{len(strategies)} 策略 × {len(profiles)} 风控档位 × "
+          f"{len(constructions)} 组合构建方案｜决策节奏 {args.cadence}")
     print(f"总仓位上限 {args.max_total_exposure:.0%}（显式；留现金覆盖成本）｜"
           f"单票 {args.max_single_weight:.0%}｜行业 {args.max_industry_weight:.0%}")
-    # 流动性排名里混着次新股（K 线不够预热），所以**边筛边取**：按流动性顺序往下走，
-    # 只保留历史长度够用的，直到凑满目标数量。否则会得到"组合里只剩 4 只"这种结果。
-    ranked = build_universe(repository, top=args.symbols * 6, as_of_ms=as_of_ms)
+
+    # --- 1. 市场日历（与标的无关；先有日历才能算决策日，才能建时点股票池）---
+    # ⚠️ 必须同时保留**原始 date_ms**：`cross_section` 要求"T 当天有成交"（`last_ms == T`），
+    # 自己造的时点（例如当日 23:59:59）会让接口静默返回空、股票池变成 0 只。
+    market_stamps = {day_from_ms(item): item for item in repository.trading_days(end_ms=as_of_ms)}
+    market_days = sorted(market_stamps)
+    if args.cadence == "monthly":
+        decision_days_all = monthly_decision_days(market_days)
+    elif args.cadence == "daily":
+        decision_days_all = set(market_days)
+    elif args.cadence.startswith("every:"):
+        decision_days_all = every_nth_decision_days(market_days,
+                                                   every=int(args.cadence.split(":", 1)[1]))
+    else:
+        print(f"未知决策节奏：{args.cadence}（可用 daily / monthly / every:N）")
+        return 1
+
+    # --- 2. 股票池：时点重建（默认）或固定池（对照）---
+    universe_info: dict | None = None
+    if args.static_universe:
+        ranked = build_universe(repository, top=args.symbols * 6, as_of_ms=as_of_ms)
+        candidates = ranked[: args.symbols * 6]
+        print(f"股票池：**固定池**（截至 {day_from_ms(as_of_ms)} 的流动性排名，"
+              f"即事后选择，仅作对照）")
+    else:
+        # 池子**按月重建**，与"交易决策节奏"解耦：指数也是定期调成分股的，
+        # 投资者可以在同一个成分股名单里更频繁地交易。两者分开才能各自单独评价
+        # （否则比较"月度 vs 周度决策"时连股票池都换了，差异分不清是谁造成的）。
+        monthly_all = monthly_decision_days(market_days)
+        usable_decisions = sorted(day for day in monthly_all
+                                  if day >= market_days[min(args.warmup_bars + 60,
+                                                            len(market_days) - 1)])
+        pocket = liquidity_universe(repository,
+                                    decision_days={day: market_stamps[day]
+                                                   for day in usable_decisions},
+                                    top=args.symbols)
+        universe_info = describe_universe(pocket) | {"selection": f"point_in_time_top_{args.symbols}"}
+        candidates = union_symbols(pocket)
+        print(f"股票池：**时点重建**（{universe_info['decision_days']} 个调仓日各排一次，"
+              f"每日 {universe_info['per_day_size']['median']:.0f} 只，"
+              f"并集 {universe_info['union_size']} 只，"
+              f"相邻月重合率中位 {universe_info['adjacent_overlap_median']:.0%}）")
+
     targets: list[PortfolioTarget] = []
-    for code in ranked:
-        if len(targets) >= args.symbols:
+    for code in candidates:
+        if args.static_universe and len(targets) >= args.symbols:
             break
         bars, _ = local_price_bars(repository, code, start_ms=0, end_ms=as_of_ms)
         if len(bars) < args.warmup_bars + 60:
             continue
         targets.append(PortfolioTarget(thscode=code, name=code, industry="未分类", bars=bars))
     if len(targets) < 5:
-        print(f"可用标的只有 {len(targets)} 只（已检查流动性前 {len(ranked)} 名），不足以组合。")
+        print(f"可用标的只有 {len(targets)} 只，不足以组合。")
         return 1
     # 预热期不计入成绩：从每只标的第 warmup_bars 根 K 线之后开始统计
     start_dates = sorted(target.bars[args.warmup_bars].date for target in targets)
     analysis_start = start_dates[len(start_dates) // 2]
     print(f"有效标的 {len(targets)} 只｜评价起点 {analysis_start}（预热 {args.warmup_bars} 根）")
+
+    # --- 3. 把决策日与池子落到**回测自己的日历**上 ---
+    trading_days = [bar.date for bar in targets[0].bars]
+    for target in targets[1:]:
+        trading_days.extend(bar.date for bar in target.bars)
+    trading_days = sorted(set(trading_days))
+    decision_days = {day for day in decision_days_all if day >= analysis_start}
+    if universe_info is not None:
+        eligible = eligibility_series(pocket, trading_days)
+    else:
+        eligible = None
+    print(f"决策日 {len(decision_days)} 个（{[d for d in sorted(decision_days)][:3]} … "
+          f"{[d for d in sorted(decision_days)][-1] if decision_days else '无'}）")
 
     thresholds = AcceptanceThresholds()
     # 市场状态序列（下跌市不交易）只在需要时才算：实测 0.7 秒一条，代价可忽略。
@@ -202,7 +275,8 @@ def main() -> int:
                     regime=(regime_gates.get(profile.regime_ma_days)
                             if profile.regime_filter else None),
                     vol_exposure=exposure_by_profile.get(profile_id),
-                    construction=policy_for(scheme))
+                    construction=policy_for(scheme),
+                    decision_days=decision_days, eligible=eligible)
                 curve = outcome["portfolio"]["curve"]
                 judgement = evaluate_acceptance(
                     curve, thresholds=thresholds, risk_stats=outcome.get("risk_stats"),
@@ -213,7 +287,7 @@ def main() -> int:
                 judgement["portfolio_metrics"] = outcome["portfolio"]["metrics"]
                 judgement["construction_audit"] = outcome.get("construction")
                 judgement["baselines"] = {
-                    "equal_weight_buy_hold": outcome["baselines"]["equal_weight_buy_hold"]["metrics"],
+                    "equal_weight_buy_hold": outcome["baselines"]["equal_weight_buy_hold"],
                     "cash": outcome["baselines"]["cash"],
                 }
                 judgement["comparison"] = outcome["comparison"]
@@ -246,8 +320,14 @@ def main() -> int:
     print(f"\n对照基线（同一股票池、同一区间）：")
     for item in results[:1]:
         base = item["baselines"]["equal_weight_buy_hold"]
-        print(f"  等权买入持有：累计 {base.get('cumulative_return_pct')}%｜"
-              f"年化 {base.get('annualized_return_pct')}%｜最大回撤 {base.get('max_drawdown_pct')}%")
+        if base.get("comparable", True):
+            print(f"  等权买入持有：累计 {base.get('cumulative_return_pct')}%｜"
+                  f"年化 {base.get('annualized_return_pct')}%｜最大回撤 {base.get('max_drawdown_pct')}%")
+        else:
+            print(f"  ⚠️ 等权买入持有**不可比**：{base.get('reason')}")
+            print(f"     （它的数字是 {base.get('cumulative_return_pct')}%，"
+                  f"但那是拿'所有曾经入选过的标的的并集'从第一天起等权持有 —— 又是一次事后选择。"
+                  f"时点池下请以 buy_hold_v1 那一行为基准。）")
 
     failed = [item for item in results if item["verdict"] != "通过"]
     if failed:
@@ -270,8 +350,12 @@ def main() -> int:
     target.write_text(json.dumps({
         "as_of": datetime.fromtimestamp(as_of_ms / 1000, CST).strftime("%Y-%m-%d"),
         "universe": {"size": len(targets), "symbols": [item.thscode for item in targets],
-                     "selection": f"liquidity_top_{args.symbols}",
+                     "selection": ("static_liquidity_top" if args.static_universe
+                                   else f"point_in_time_top_{args.symbols}"),
+                     **({"point_in_time": universe_info} if universe_info else {}),
                      "industry_data": "none：本地无行业分类数据，**行业上限未生效**"},
+        "cadence": args.cadence,
+        "decision_days": len(decision_days),
         "cost_bps_one_way": args.cost_bps,
         "portfolio_limits": {
             "max_positions": args.max_positions,

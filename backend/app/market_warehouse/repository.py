@@ -856,6 +856,34 @@ class WarehouseRepository:
         finally:
             db.close()
 
+    def trading_days(self, *, start_ms: int | None = None,
+                     end_ms: int | None = None) -> list[int]:
+        """全市场**去重**交易日（升序）。
+
+        为什么要单独开一个方法：决策节奏（`portfolio/schedule.py`）需要"市场日历"，
+        而在装配股票池之前**拿不到任何标的的 K 线**——用某一只标的的日期当日历会有
+        "它停牌就少一天"的隐患。这里直接取 `daily_k` 的去重日期，是唯一诚实的日历来源。
+        """
+        if not self.path.exists():
+            return []
+        clauses, params = [], []
+        if start_ms is not None:
+            clauses.append("date_ms >= ?")
+            params.append(start_ms)
+        if end_ms is not None:
+            clauses.append("date_ms <= ?")
+            params.append(end_ms)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        db = duckdb.connect(str(self.path), read_only=True)
+        try:
+            rows = db.execute(f"SELECT DISTINCT date_ms FROM daily_k {where} ORDER BY 1",
+                              params).fetchall()
+        except duckdb.CatalogException:
+            return []
+        finally:
+            db.close()
+        return [row[0] for row in rows]
+
     def month_end_trading_days(self, *, start_ms: int | None = None,
                                end_ms: int | None = None) -> list[int]:
         """每个自然月的**最后一个交易日**（固定 SQL）。月度横截面评价的采样点。"""

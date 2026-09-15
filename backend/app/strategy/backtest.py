@@ -18,6 +18,11 @@ def current_signal_snapshot(strategy_id: str, bars: list[PriceBar], *, gate: dic
         if strategy_id == "trend_20_60_v1":
             desired = int(bool(previous.get("ma20") and previous.get("ma60")
                                and bars[i - 1].close > previous["ma20"] > previous["ma60"]))
+        elif strategy_id == "buy_hold_v1":
+            # **持有不动**：只要它还在（时点）股票池里就一直拿着，由组合层决定什么时候
+            # 因为“掉出池子”而卖掉。它存在的意义是当**对照组**——回答“不做任何择时，
+            # 只靠分散与仓位管理能拿到什么”，这是散户最该先知道的一个数。
+            desired = 1
         else:
             desired = (int(held < 5) if position else int(bool(
                 previous.get("ret5_q10") is not None and previous.get("ret5") is not None
@@ -37,6 +42,8 @@ def current_signal_snapshot(strategy_id: str, bars: list[PriceBar], *, gate: dic
     if strategy_id == "trend_20_60_v1":
         desired_next = int(bool(latest.get("ma20") and latest.get("ma60")
                                 and bars[-1].close > latest["ma20"] > latest["ma60"]))
+    elif strategy_id == "buy_hold_v1":
+        desired_next = 1
     else:
         desired_next = (int(held < 5) if position else int(bool(
             latest.get("ret5_q10") is not None and latest.get("ret5") is not None
@@ -105,6 +112,11 @@ def run_backtest(strategy_id: str, bars: list[PriceBar], cost_bps: int, *,
             if strategy_id == "trend_20_60_v1":
                 desired = int(bool(previous.get("ma20") and previous.get("ma60")
                                    and bars[i - 1].close > previous["ma20"] > previous["ma60"]))
+            elif strategy_id == "buy_hold_v1":
+                # **持有不动**（对照组）：只要还在（时点）股票池里就一直拿着，
+                # 什么时候因为"掉出池子"而卖掉由组合层决定。它回答的问题是
+                # "不做任何择时、只靠分散与仓位管理能拿到什么"——散户最该先知道的一个数。
+                desired = 1
             else:
                 desired = (int(held < 5) if position else int(bool(
                     previous.get("ret5_q10") is not None and previous.get("ret5") is not None

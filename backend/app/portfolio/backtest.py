@@ -209,6 +209,8 @@ def run_portfolio_backtest(
     regime: dict[str, bool] | None = None,
     vol_exposure: dict[str, float] | None = None,
     construction: ConstructionPolicy | None = None,
+    decision_days: set[str] | None = None,
+    eligible: dict[str, set[str]] | None = None,
 ) -> dict:
     """按日滚动配置研究组合；无信号或触及上限后不强行买入。
 
@@ -228,6 +230,14 @@ def run_portfolio_backtest(
     这样"满仓"不会因为付不起手续费而变成借款（引擎会直接报错，而不是悄悄少买）。
     在此之前，"投多少"是被**行业上限隐式**决定的：行业标签缺失时，"行业上限 30%"
     会退化成"总仓位 30%"，而且报告里看不到。这个参数就是那个 bug 的修复。
+
+    `decision_days` 是**决策节奏**（`portfolio/schedule.py`）：只有这些日子可以**加仓或换股**；
+    其余日子只能**减仓**（信号消失的照常卖出），卖出的钱按原比例分摊给仍在信号内的持仓
+    以维持目标暴露。传 `None` = 每天都可重新决定（= 历史行为）。
+    降换手只能从这一层做——实测"权重层换手带"对总换手几乎无效，因为换手来自信号进出。
+
+    `eligible` 是**时点股票池**：``{交易日: 当日可选标的集合}``。不在当日集合里的标的
+    不得持有（相当于指数调出成分股）。传 `None` = 不做时点约束（= 固定股票池，历史行为）。
     """
     if not targets:
         raise ValueError("组合至少需要一个标的。")
@@ -265,7 +275,11 @@ def run_portfolio_backtest(
     risk_stats = dict(risk_totals)
     risk_stats.update({"breaker_triggers": 0, "breaker_pause_days": 0,
                        "vol_target_scaled_days": 0, "vol_target_avg_exposure_pct": 0.0,
-                       "vol_target_min_exposure_pct": 100.0})
+                       "vol_target_min_exposure_pct": 100.0,
+                       "schedule_decision_days": 0, "schedule_hold_days": 0,
+                       "schedule_carry_days": 0, "eligible_blocked_days": 0})
+    #: 上一次决策日的目标权重（非决策日只减不增，需要它作为基准）。
+    last_decision_weights: dict[str, float] = {}
     exposure_sum = 0.0
     exposure_days = 0
     exposure_min = 1.0
@@ -297,7 +311,12 @@ def run_portfolio_backtest(
                 risk_stats["breaker_pause_days"] += 1
         paused = pause_left > 0
         candidates = []
+        allowed = None if eligible is None else eligible.get(day)
         for code, active_ids in active.get(day, {}).items():
+            # **时点股票池**：不在当日可选集合里的标的不得持有（相当于指数调出成分股）。
+            if allowed is not None and code not in allowed:
+                risk_stats["eligible_blocked_days"] += 1
+                continue
             target = target_by_code[code]
             candidates.append({"thscode": code, "name": target.name, "industry": target.industry,
                                "strategy_ids": sorted(active_ids), "score": len(active_ids)})
@@ -308,6 +327,29 @@ def run_portfolio_backtest(
             target_weights = ({code: value / pre_trade_equity for code, value in kept.items()}
                               if pre_trade_equity else {})
             exposure = 1.0
+        elif decision_days is not None and day not in decision_days:
+            # **非决策日：只减不增**。这是散户打法的核心节奏（`schedule.py`）。
+            # 仍在内信号里的持仓**按上次决策的比例维持**（份额重新归一化到原有总暴露），
+            # 信号消失的照常卖出，卖出的钱按原比例分给还在的持仓，其余留现金。
+            # 三种做法里选了"按比例分给还在的持仓"：
+            #   - 什么都不做（钱留现金）→ 暴露在一个月内被动衰减，那不是决策，是副作用；
+            #   - 分给"分数最高"的 → 那是**新的选股决策**，等于每天还在挑股。
+            survivors = {code: weight for code, weight in last_decision_weights.items()
+                         if code in active.get(day, {}) and day in price_maps.get(code, {})}
+            if survivors:
+                total = sum(last_decision_weights.values())
+                kept_total = sum(survivors.values())
+                scale = (total / kept_total) if kept_total > 0 else 0.0
+                target_weights = {code: weight * scale for code, weight in survivors.items()}
+            else:
+                target_weights = {}
+            risk_stats["schedule_hold_days"] += 1
+            if survivors:
+                risk_stats["schedule_carry_days"] += 1
+            exposure = 1.0 if vol_exposure is None else float(vol_exposure.get(day, 1.0))
+            exposure = min(1.0, max(0.0, exposure))
+            if target_weights and exposure < 1.0:
+                target_weights = {code: weight * exposure for code, weight in target_weights.items()}
         else:
             target_weights = allocate_candidates(
                 candidates, max_positions=max_positions, max_single_weight=max_single_weight,
@@ -322,6 +364,7 @@ def run_portfolio_backtest(
                                      for code, series in return_series.items()
                                      if code in {str(item["thscode"]) for item in candidates}},
                     industries=industries, current_weights=current)
+            risk_stats["schedule_decision_days"] += 1
             # 波动率目标：整体缩放总仓位（封顶 1.0，不加杠杆）。熔断暂停期间不缩放——
             # 那时已经在降风险，再叠一层会让两套规则的归因纠缠不清。
             exposure = 1.0 if vol_exposure is None else float(vol_exposure.get(day, 1.0))
@@ -352,6 +395,9 @@ def run_portfolio_backtest(
         for code in set(target_values) | set(holdings):
             if day not in price_maps[code]:
                 target_values[code] = holdings.get(code, 0.0)
+        # 记录"这次决策定下的权重"，供下一个非决策日沿用（只减不增）。
+        if decision_days is None or day in decision_days:
+            last_decision_weights = dict(target_weights)
         turnover = sum(abs(target_values.get(code, 0.0) - holdings.get(code, 0.0))
                        for code in set(target_values) | set(holdings))
         transaction_cost = turnover * cost_rate
@@ -383,7 +429,8 @@ def run_portfolio_backtest(
                       "invested_weight": round(invested_weight, 8), "candidate_count": len(candidates),
                       "selected_count": len(target_weights), "turnover_value": round(turnover, 10),
                       "transaction_cost": round(transaction_cost, 10),
-                      "exposure": round(exposure, 8)})
+                      "exposure": round(exposure, 8),
+                      "decision_day": decision_days is None or day in decision_days})
 
     if exposure_days:
         risk_stats["vol_target_avg_exposure_pct"] = round(exposure_sum / exposure_days * 100, 4)
@@ -422,7 +469,17 @@ def run_portfolio_backtest(
         "portfolio": {"curve": curve, "metrics": portfolio_metrics, "trades": trades,
                       "daily_candidates": daily_candidates},
         "baselines": {"cash": {"cumulative_return_pct": 0.0, "max_drawdown_pct": 0.0},
-                      "equal_weight_buy_hold": {"curve": equal_curve, "metrics": equal_metrics}},
+                      "equal_weight_buy_hold": {
+                          "curve": equal_curve, "metrics": equal_metrics,
+                          # ⚠️ 时点股票池下这个基线**不可比**：它对 `targets` 全体（= 所有
+                          # 曾经入选过的标的的**并集**）从第一天起就等权持有，等于又用了一次
+                          # 事后信息（2017 年就持有了 2024 年才入选的股票）。实测差距巨大：
+                          # 同一批标的，这个基线 +115.8%，而按时点池每月重建的被动组合 −25.5%。
+                          # 时点池下正确的基准是 `buy_hold_v1` 那一行（同样受 eligible 约束）。
+                          "comparable": eligible is None,
+                          "reason": (None if eligible is None else
+                                     "时点股票池下不可比：该基线对整个并集从第一天起等权持有，"
+                                     "含事后信息；请改用同受 eligible 约束的 buy_hold_v1 行")}},
         "comparison": {"excess_vs_equal_weight_pct": round(
             portfolio_metrics["cumulative_return_pct"] - equal_metrics["cumulative_return_pct"], 4),
                        "excess_vs_cash_pct": portfolio_metrics["cumulative_return_pct"]},
