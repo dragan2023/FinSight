@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 from backend.app.market_warehouse.repository import WarehouseRepository  # noqa: E402
 from backend.app.portfolio.backtest import PortfolioTarget, run_portfolio_backtest  # noqa: E402
+from backend.app.portfolio.construction import ConstructionPolicy  # noqa: E402
 from backend.app.settings import load_settings  # noqa: E402
 from backend.app.strategy.acceptance import (  # noqa: E402
     AcceptanceThresholds,
@@ -75,6 +76,18 @@ def main() -> int:
     parser.add_argument("--max-positions", type=int, default=10)
     parser.add_argument("--max-single-weight", type=float, default=0.10)
     parser.add_argument("--max-industry-weight", type=float, default=0.30)
+    #: **显式的总仓位上限**。默认 0.95（留 5% 现金覆盖换手成本）。
+    #: 2026-09-15 之前没有这个参数，"投多少"是被行业上限**隐式**决定的；而验收脚本把
+    #: 所有标的的行业都写成 `未分类`，于是"行业上限 30%"退化成了"总仓位 30%"，
+    #: 对照的等权买入持有却是满仓——那个对比不公平，而且报告里看不出来。
+    parser.add_argument("--max-total-exposure", type=float, default=0.95)
+    #: 组合构建方案：`rank_equal`（历史对照）/ `inverse_vol` / `equal_risk`。
+    #: 三个一起跑才能说清"是风险分配起了作用，还是别的"。
+    parser.add_argument("--constructions", default="rank_equal,inverse_vol,equal_risk")
+    parser.add_argument("--turnover-band", type=float, default=0.0,
+                        help="换手带：目标与当前权重之差小于它就不调仓（0 = 每次调）")
+    parser.add_argument("--risk-lookback-days", type=int, default=120)
+    parser.add_argument("--shrinkage", type=float, default=0.5)
     parser.add_argument("--warmup-bars", type=int, default=252, help="预热 K 线不计入成绩")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
@@ -88,11 +101,31 @@ def main() -> int:
     symbols = build_universe(repository, top=args.symbols, as_of_ms=as_of_ms)
     strategies = [item.strip() for item in args.strategies.split(",") if item.strip()]
     profiles = [item.strip() for item in args.risk_profiles.split(",") if item.strip()]
+    constructions = [item.strip() for item in args.constructions.split(",") if item.strip()]
+    unknown = [item for item in constructions
+               if item not in ("rank_equal", "inverse_vol", "equal_risk")]
+    if unknown:
+        print(f"未知的组合构建方案：{unknown}")
+        return 1
+
+    def policy_for(scheme: str) -> ConstructionPolicy | None:
+        """`rank_equal` 走**历史路径**（`construction=None`），保证"新旧对比只有一个变量"。"""
+        if scheme == "rank_equal":
+            return None
+        return ConstructionPolicy(
+            scheme=scheme, lookback_days=args.risk_lookback_days, shrinkage=args.shrinkage,
+            turnover_band=args.turnover_band, max_positions=args.max_positions,
+            max_single_weight=args.max_single_weight,
+            max_industry_weight=args.max_industry_weight,
+            max_total_exposure=args.max_total_exposure)
 
     started = time.time()
     print(f"目标股票池：流动性前 {args.symbols} 只（截至 "
           f"{datetime.fromtimestamp(as_of_ms / 1000, CST):%Y-%m-%d}）"
-          f"｜成本 {args.cost_bps}bps/边｜{len(strategies)} 策略 × {len(profiles)} 风控档位")
+          f"｜成本 {args.cost_bps}bps/边｜{len(strategies)} 策略 × {len(profiles)} 风控档位 × "
+          f"{len(constructions)} 组合构建方案")
+    print(f"总仓位上限 {args.max_total_exposure:.0%}（显式；留现金覆盖成本）｜"
+          f"单票 {args.max_single_weight:.0%}｜行业 {args.max_industry_weight:.0%}")
     # 流动性排名里混着次新股（K 线不够预热），所以**边筛边取**：按流动性顺序往下走，
     # 只保留历史长度够用的，直到凑满目标数量。否则会得到"组合里只剩 4 只"这种结果。
     ranked = build_universe(repository, top=args.symbols * 6, as_of_ms=as_of_ms)
@@ -159,45 +192,56 @@ def main() -> int:
     for strategy in strategies:
         for profile_id in profiles:
             profile = get_risk_profile(profile_id)
-            outcome = run_portfolio_backtest(
-                targets, strategy_ids=[strategy], one_way_cost_bps=args.cost_bps,
-                max_positions=args.max_positions, max_single_weight=args.max_single_weight,
-                max_industry_weight=args.max_industry_weight,
-                analysis_start_date=analysis_start, risk=profile,
-                regime=(regime_gates.get(profile.regime_ma_days)
-                        if profile.regime_filter else None),
-                vol_exposure=exposure_by_profile.get(profile_id))
-            curve = outcome["portfolio"]["curve"]
-            judgement = evaluate_acceptance(curve, thresholds=thresholds,
-                                            risk_stats=outcome.get("risk_stats"),
-                                            label=f"{strategy} × {profile_id}")
-            judgement["portfolio_metrics"] = outcome["portfolio"]["metrics"]
-            judgement["baselines"] = {
-                "equal_weight_buy_hold": outcome["baselines"]["equal_weight_buy_hold"]["metrics"],
-                "cash": outcome["baselines"]["cash"],
-            }
-            judgement["comparison"] = outcome["comparison"]
-            results.append(judgement)
-            print(f"  ✓ {strategy:<18}{profile_id:<22} "
-                  f"累计 {judgement['metrics']['cumulative_return_pct']:>9.2f}%  "
-                  f"年化 {judgement['metrics']['annualized_return_pct']:>8.2f}%  "
-                  f"最大回撤 {judgement['metrics']['max_drawdown_pct']:>7.2f}%  "
-                  f"单年最差 {judgement['metrics']['worst_year_return_pct']:>7.2f}%  "
-                  f"→ {judgement['verdict']}")
+            for scheme in constructions:
+                outcome = run_portfolio_backtest(
+                    targets, strategy_ids=[strategy], one_way_cost_bps=args.cost_bps,
+                    max_positions=args.max_positions, max_single_weight=args.max_single_weight,
+                    max_industry_weight=args.max_industry_weight,
+                    max_total_exposure=args.max_total_exposure,
+                    analysis_start_date=analysis_start, risk=profile,
+                    regime=(regime_gates.get(profile.regime_ma_days)
+                            if profile.regime_filter else None),
+                    vol_exposure=exposure_by_profile.get(profile_id),
+                    construction=policy_for(scheme))
+                curve = outcome["portfolio"]["curve"]
+                judgement = evaluate_acceptance(
+                    curve, thresholds=thresholds, risk_stats=outcome.get("risk_stats"),
+                    label=f"{strategy} × {profile_id} × {scheme}")
+                judgement["strategy_id"] = strategy
+                judgement["risk_profile_id"] = profile_id
+                judgement["construction_scheme"] = scheme
+                judgement["portfolio_metrics"] = outcome["portfolio"]["metrics"]
+                judgement["construction_audit"] = outcome.get("construction")
+                judgement["baselines"] = {
+                    "equal_weight_buy_hold": outcome["baselines"]["equal_weight_buy_hold"]["metrics"],
+                    "cash": outcome["baselines"]["cash"],
+                }
+                judgement["comparison"] = outcome["comparison"]
+                results.append(judgement)
+                portfolio_metrics = judgement["portfolio_metrics"]
+                print(f"  ✓ {strategy:<17}{profile_id:<22}{scheme:<13} "
+                      f"累计 {judgement['metrics']['cumulative_return_pct']:>9.2f}%  "
+                      f"年化 {judgement['metrics']['annualized_return_pct']:>8.2f}%  "
+                      f"回撤 {judgement['metrics']['max_drawdown_pct']:>7.2f}%  "
+                      f"仓位 {portfolio_metrics.get('avg_invested_weight_pct', 0):>6.1f}%  "
+                      f"→ {judgement['verdict']}")
 
-    print(f"\n{'=' * 104}\n验收判定（阈值：最大回撤 ≤{thresholds.max_drawdown_pct}%｜"
+    print(f"\n{'=' * 116}\n验收判定（阈值：最大回撤 ≤{thresholds.max_drawdown_pct}%｜"
           f"单年最差 ≥−{thresholds.max_worst_year_loss_pct}%｜回撤持续 ≤"
-          f"{thresholds.max_drawdown_duration_days} 天｜期望 >0）\n{'=' * 104}")
-    header = (f"{'策略':<18}{'风控档位':<22}{'累计':>10}{'年化':>9}{'最大回撤':>10}"
-              f"{'单年最差':>10}{'回撤天数':>9}  判定")
+          f"{thresholds.max_drawdown_duration_days} 天｜期望 >0）\n{'=' * 116}")
+    header = (f"{'策略':<17}{'风控档位':<22}{'构建方案':<13}{'累计':>9}{'年化':>8}"
+              f"{'最大回撤':>9}{'单年最差':>9}{'回撤天数':>8}{'平均仓位':>9}{'换手':>8}  判定")
     print(header)
     for item in results:
         metrics = item["metrics"]
-        print(f"{item['label'].split(' × ')[0]:<18}"
-              f"{item['label'].split(' × ')[1]:<22}"
-              f"{metrics['cumulative_return_pct']:>10.2f}{metrics['annualized_return_pct']:>9.2f}"
-              f"{metrics['max_drawdown_pct']:>10.2f}{metrics['worst_year_return_pct']:>10.2f}"
-              f"{metrics['max_drawdown_duration_days']:>9}  {item['verdict']}")
+        portfolio_metrics = item["portfolio_metrics"]
+        print(f"{item['strategy_id']:<17}{item['risk_profile_id']:<22}"
+              f"{item['construction_scheme']:<13}"
+              f"{metrics['cumulative_return_pct']:>9.2f}{metrics['annualized_return_pct']:>8.2f}"
+              f"{metrics['max_drawdown_pct']:>9.2f}{metrics['worst_year_return_pct']:>9.2f}"
+              f"{metrics['max_drawdown_duration_days']:>8}"
+              f"{portfolio_metrics.get('avg_invested_weight_pct', 0):>8.1f}%"
+              f"{portfolio_metrics.get('annualized_turnover_pct', 0):>7.0f}%  {item['verdict']}")
 
     print(f"\n对照基线（同一股票池、同一区间）：")
     for item in results[:1]:
@@ -226,8 +270,20 @@ def main() -> int:
     target.write_text(json.dumps({
         "as_of": datetime.fromtimestamp(as_of_ms / 1000, CST).strftime("%Y-%m-%d"),
         "universe": {"size": len(targets), "symbols": [item.thscode for item in targets],
-                     "selection": f"liquidity_top_{args.symbols}"},
+                     "selection": f"liquidity_top_{args.symbols}",
+                     "industry_data": "none：本地无行业分类数据，**行业上限未生效**"},
         "cost_bps_one_way": args.cost_bps,
+        "portfolio_limits": {
+            "max_positions": args.max_positions,
+            "max_single_weight": args.max_single_weight,
+            "max_industry_weight": args.max_industry_weight,
+            "max_industry_weight_applied": False,
+            "max_total_exposure": args.max_total_exposure,
+        },
+        "constructions": constructions,
+        "construction_params": {"risk_lookback_days": args.risk_lookback_days,
+                                "shrinkage": args.shrinkage,
+                                "turnover_band": args.turnover_band},
         "risk_profiles": {pid: get_risk_profile(pid).model_dump() for pid in profiles},
         "thresholds": thresholds.model_dump(),
         "results": results,
